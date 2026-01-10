@@ -1,0 +1,73 @@
+<idea-plugin>
+    <id>com.serialport.plugin</id>
+    <name>Serial Port Tool</name>
+    <vendor email="support@serialport.com" url="https://github.com/serialport/plugin">Serial Port Team</vendor>
+
+    <description><![CDATA[
+    <h2>Android Studio Serial Port Tool Plugin</h2>
+    <p>A comprehensive serial port communication tool for Android Studio and IntelliJ IDEA.</p>
+    
+    <h3>Features:</h3>
+    <ul>
+        <li><b>Port Management</b> - Scan, connect, disconnect, and auto-reconnect to serial ports</li>
+        <li><b>Data Communication</b> - Send and receive data in ASCII or HEX format</li>
+        <li><b>Real-time Display</b> - View communication data with timestamps and auto-scroll</li>
+        <li><b>Quick Commands</b> - Save and manage frequently used commands</li>
+        <li><b>Log Export</b> - Export communication logs to text files</li>
+        <li><b>Port Configuration</b> - Configure baud rate, data bits, stop bits, and parity</li>
+        <li><b>Persistent Settings</b> - Automatically save your preferences</li>
+    </ul>
+    
+    <h3>Usage:</h3>
+    <ol>
+        <li>Open the Serial Port tool window from View → Tool Windows → Serial Port</li>
+        <li>Select a serial port from the dropdown and set the baud rate</li>
+        <li>Click "Connect" to establish connection</li>
+        <li>Use the send field to transmit data</li>
+        <li>Save frequently used commands with the "Quick Commands" button</li>
+        <li>Export logs for analysis or debugging</li>
+    </ol>
+    
+    <p><b>Perfect for:</b> IoT development, hardware debugging, embedded systems, Arduino communication, and any serial port testing needs.</p>
+    ]]></description>
+
+    <change-notes><![CDATA[
+    <h3>Version 1.0.0</h3>
+    <ul>
+        <li>Initial release</li>
+        <li>Serial port connection management</li>
+        <li>ASCII/HEX data transmission</li>
+        <li>Real-time data display with timestamps</li>
+        <li>Quick command management</li>
+        <li>Log export functionality</li>
+        <li>Auto-reconnect feature</li>
+        <li>Persistent configuration</li>
+    </ul>
+    ]]></change-notes>
+
+    <!-- Product and Plugin Compatibility Requirements -->
+    <depends>com.intellij.modules.platform</depends>
+
+    <!-- Extension Points -->
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Tool Window -->
+        <toolWindow
+            id="Serial Port"
+            anchor="bottom"
+            factoryClass="com.serialport.plugin.SerialPortToolWindowFactory"
+            icon="/icons/serialPort.svg"/>
+        
+        <!-- Project Services -->
+        <projectService
+            serviceImplementation="com.serialport.plugin.SerialPortService"/>
+        <projectService
+            serviceImplementation="com.serialport.plugin.CommandManager"/>
+        <projectService
+            serviceImplementation="com.serialport.plugin.SerialPortSettings"/>
+    </extensions>
+
+    <!-- Actions -->
+    <actions>
+        <!-- Optional: Add menu actions here if needed -->
+    </actions>
+</idea-plugin>

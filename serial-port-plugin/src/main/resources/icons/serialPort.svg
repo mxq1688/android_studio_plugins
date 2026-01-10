@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 13 13">
+  <!-- Serial Port Icon - RS232 connector style -->
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6B9BFA;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#3574F0;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Connector body -->
+  <rect x="1" y="3" width="11" height="7" rx="1.5" ry="1.5" fill="url(#grad)" />
+  
+  <!-- Pin holes - top row -->
+  <circle cx="3.5" cy="5" r="0.8" fill="#FFFFFF"/>
+  <circle cx="6.5" cy="5" r="0.8" fill="#FFFFFF"/>
+  <circle cx="9.5" cy="5" r="0.8" fill="#FFFFFF"/>
+  
+  <!-- Pin holes - bottom row -->
+  <circle cx="5" cy="8" r="0.8" fill="#FFFFFF"/>
+  <circle cx="8" cy="8" r="0.8" fill="#FFFFFF"/>
+  
+  <!-- Data flow arrows -->
+  <path d="M0.5 6.5 L1 6.5" stroke="#5FB865" stroke-width="1" stroke-linecap="round"/>
+  <path d="M12 6.5 L12.5 6.5" stroke="#F26522" stroke-width="1" stroke-linecap="round"/>
+</svg>
