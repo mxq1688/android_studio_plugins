@@ -47,7 +47,11 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     // 顶部栏组件
     private val portComboBox = JComboBox<String>()
-    private val baudRateComboBox = JComboBox(arrayOf("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"))
+    private val baudRateComboBox = JComboBox(arrayOf(
+        "300", "600", "1200", "2400", "4800", "9600", "14400", "19200", 
+        "28800", "38400", "56000", "57600", "115200", "128000", "230400", 
+        "256000", "460800", "500000", "921600", "1000000", "1500000", "2000000"
+    ))
     private val connectButton = JButton()
     
     // Logcat 风格过滤器
@@ -65,48 +69,63 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     // 状态
     private var isConnected = false
     private var autoScroll = true
+    private var isPaused = false  // 暂停日志更新
     private var showTimestamp = true
     private var displayHex = false
     
-    // 文本样式
-    private val txStyle: Style
-    private val rxStyle: Style
-    private val sysStyle: Style
-    private val errStyle: Style
+    // UI 引用 (用于状态同步)
+    private var autoScrollBtn: JButton? = null
+    private var pauseBtn: JButton? = null
+    private var logScrollPane: JBScrollPane? = null
     
-    // Logcat 过滤器语法提示
+    // Logcat 风格文本样式
+    private val verboseStyle: Style
+    private val debugStyle: Style
+    private val infoStyle: Style
+    private val warnStyle: Style
+    private val errorStyle: Style
+    
+    // Logcat 风格过滤器语法提示
     private val filterSuggestions = listOf(
-        FilterSuggestion("message:", "消息包含", "message:error"),
-        FilterSuggestion("message~:", "消息正则匹配", "message~:err.*"),
-        FilterSuggestion("-message:", "消息不包含", "-message:debug"),
-        FilterSuggestion("dir:TX", "只看发送", "dir:TX"),
-        FilterSuggestion("dir:RX", "只看接收", "dir:RX"),
-        FilterSuggestion("dir:SYS", "只看系统消息", "dir:SYS"),
-        FilterSuggestion("level:VERBOSE", "级别 >= VERBOSE", "level:V"),
-        FilterSuggestion("level:DEBUG", "级别 >= DEBUG", "level:D"),
-        FilterSuggestion("level:INFO", "级别 >= INFO", "level:I"),
-        FilterSuggestion("level:WARN", "级别 >= WARN", "level:W"),
-        FilterSuggestion("level:ERROR", "级别 >= ERROR", "level:E")
+        // 消息过滤
+        FilterSuggestion("message:", "Log message contains string", "message:error"),
+        FilterSuggestion("message=:", "Log message is exactly string", "message=:OK"),
+        FilterSuggestion("message~:", "Log message matches regex", "message~:err.*"),
+        FilterSuggestion("-message:", "Log message does not contain string", "-message:debug"),
+        FilterSuggestion("-message=:", "Log message is not exactly string", "-message=:OK"),
+        FilterSuggestion("-message~:", "Log message does not match regex", "-message~:err.*"),
+        // 方向过滤
+        FilterSuggestion("dir:", "Filter by direction (TX/RX/SYS)", "dir:RX"),
+        FilterSuggestion("-dir:", "Exclude direction", "-dir:SYS"),
+        // 级别过滤
+        FilterSuggestion("level:", "Minimum log level (V/D/I/W/E)", "level:W")
     )
     
     data class FilterSuggestion(val syntax: String, val description: String, val example: String)
     
     init {
-        // 初始化样式
+        // 初始化 Logcat 风格样式
         val defaultStyle = StyleContext.getDefaultStyleContext().getStyle(StyleContext.DEFAULT_STYLE)
         
-        txStyle = logArea.addStyle("TX", defaultStyle)
-        StyleConstants.setForeground(txStyle, JBColor(Color(0, 102, 204), Color(100, 149, 237)))
+        // V - Verbose: 灰色
+        verboseStyle = logArea.addStyle("VERBOSE", defaultStyle)
+        StyleConstants.setForeground(verboseStyle, JBColor(Color(128, 128, 128), Color(150, 150, 150)))
         
-        rxStyle = logArea.addStyle("RX", defaultStyle)
-        StyleConstants.setForeground(rxStyle, JBColor(Color(0, 153, 0), Color(80, 200, 80)))
+        // D - Debug: 蓝色
+        debugStyle = logArea.addStyle("DEBUG", defaultStyle)
+        StyleConstants.setForeground(debugStyle, JBColor(Color(0, 102, 204), Color(86, 156, 214)))
         
-        sysStyle = logArea.addStyle("SYS", defaultStyle)
-        StyleConstants.setForeground(sysStyle, JBColor.GRAY)
-        StyleConstants.setItalic(sysStyle, true)
+        // I - Info: 绿色
+        infoStyle = logArea.addStyle("INFO", defaultStyle)
+        StyleConstants.setForeground(infoStyle, JBColor(Color(0, 128, 0), Color(78, 201, 176)))
         
-        errStyle = logArea.addStyle("ERR", defaultStyle)
-        StyleConstants.setForeground(errStyle, JBColor.RED)
+        // W - Warn: 橙色/黄色
+        warnStyle = logArea.addStyle("WARN", defaultStyle)
+        StyleConstants.setForeground(warnStyle, JBColor(Color(187, 134, 0), Color(220, 180, 80)))
+        
+        // E - Error: 红色
+        errorStyle = logArea.addStyle("ERROR", defaultStyle)
+        StyleConstants.setForeground(errorStyle, JBColor(Color(187, 0, 0), Color(244, 108, 108)))
         
         setupUI()
         setupListeners()
@@ -318,9 +337,25 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         clearBtn.addActionListener { filterManager.clearLogs() }
         toolbar.add(clearBtn)
         
+        // 暂停/继续日志 (Logcat 风格)
+        pauseBtn = createToggleButton(AllIcons.Actions.Pause, "暂停日志", isPaused)
+        pauseBtn!!.addActionListener {
+            isPaused = !isPaused
+            updateToggleButton(pauseBtn!!, isPaused)
+            if (!isPaused) {
+                // 恢复时刷新显示并滚动到底部
+                refreshDisplay()
+            }
+        }
+        toolbar.add(pauseBtn)
+        
         // 滚动到底部
         val scrollBtn = createToolbarButton(AllIcons.Actions.MoveDown, "滚动到底部")
-        scrollBtn.addActionListener { scrollToBottom() }
+        scrollBtn.addActionListener { 
+            autoScroll = true
+            updateToggleButton(autoScrollBtn!!, autoScroll)
+            scrollToBottom() 
+        }
         toolbar.add(scrollBtn)
         
         toolbar.add(Box.createVerticalStrut(8))
@@ -328,10 +363,10 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         toolbar.add(Box.createVerticalStrut(8))
         
         // 自动滚动
-        val autoScrollBtn = createToggleButton(AllIcons.Actions.SynchronizeScrolling, "自动滚动", autoScroll)
-        autoScrollBtn.addActionListener {
+        autoScrollBtn = createToggleButton(AllIcons.Actions.SynchronizeScrolling, "自动滚动", autoScroll)
+        autoScrollBtn!!.addActionListener {
             autoScroll = !autoScroll
-            updateToggleButton(autoScrollBtn, autoScroll)
+            updateToggleButton(autoScrollBtn!!, autoScroll)
         }
         toolbar.add(autoScrollBtn)
         
@@ -444,10 +479,29 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         logArea.background = JBColor(Color(43, 43, 43), Color(43, 43, 43))
         logArea.foreground = JBColor(Color(187, 187, 187), Color(187, 187, 187))
         
-        val scrollPane = JBScrollPane(logArea)
-        scrollPane.border = BorderFactory.createEmptyBorder()
+        logScrollPane = JBScrollPane(logArea)
+        logScrollPane!!.border = BorderFactory.createEmptyBorder()
         
-        panel.add(scrollPane, BorderLayout.CENTER)
+        // 使用鼠标滚轮监听检测用户手动滚动
+        logScrollPane!!.addMouseWheelListener { e ->
+            if (e.wheelRotation < 0 && autoScroll) {
+                // 用户向上滚动（wheelRotation < 0 表示向上）
+                autoScroll = false
+                autoScrollBtn?.let { updateToggleButton(it, autoScroll) }
+            }
+        }
+        
+        // 鼠标拖动滚动条也算手动滚动
+        logScrollPane!!.verticalScrollBar.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent?) {
+                if (autoScroll) {
+                    autoScroll = false
+                    autoScrollBtn?.let { updateToggleButton(it, autoScroll) }
+                }
+            }
+        })
+        
+        panel.add(logScrollPane, BorderLayout.CENTER)
         return panel
     }
     
@@ -652,7 +706,10 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         
         var keyword = ""
         var isRegex = false
+        var isExact = false
         var excludeKeyword = ""
+        var excludeIsRegex = false
+        var excludeIsExact = false
         var showTx = true
         var showRx = true
         var showSys = true
@@ -661,15 +718,28 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         val parts = expression.split("\\s+".toRegex())
         for (part in parts) {
             when {
-                part.startsWith("message~:") -> { keyword = part.substringAfter("message~:"); isRegex = true }
-                part.startsWith("message:") -> keyword = part.substringAfter("message:")
+                // 排除过滤 (Logcat 风格)
+                part.startsWith("-message~:") -> { excludeKeyword = part.substringAfter("-message~:"); excludeIsRegex = true }
+                part.startsWith("-message=:") -> { excludeKeyword = part.substringAfter("-message=:"); excludeIsExact = true }
                 part.startsWith("-message:") -> excludeKeyword = part.substringAfter("-message:")
+                // 包含过滤 (Logcat 风格)
+                part.startsWith("message~:") -> { keyword = part.substringAfter("message~:"); isRegex = true }
+                part.startsWith("message=:") -> { keyword = part.substringAfter("message=:"); isExact = true }
+                part.startsWith("message:") -> keyword = part.substringAfter("message:")
+                // 方向过滤
+                part.startsWith("-dir:") -> {
+                    val dir = part.substringAfter("-dir:").uppercase()
+                    if (dir == "TX") showTx = false
+                    if (dir == "RX") showRx = false
+                    if (dir == "SYS") showSys = false
+                }
                 part.startsWith("dir:") -> {
                     val dir = part.substringAfter("dir:").uppercase()
-                    showTx = dir == "TX" || dir == "ALL"
-                    showRx = dir == "RX" || dir == "ALL"
-                    showSys = dir == "SYS" || dir == "ALL"
+                    showTx = dir == "TX"
+                    showRx = dir == "RX"
+                    showSys = dir == "SYS"
                 }
+                // 级别过滤
                 part.startsWith("level:") -> {
                     minLevel = when (part.substringAfter("level:").uppercase()) {
                         "V", "VERBOSE" -> LogLevel.VERBOSE
@@ -680,14 +750,18 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                         else -> LogLevel.VERBOSE
                     }
                 }
-                else -> if (keyword.isEmpty()) keyword = part
+                // 普通关键词
+                else -> if (keyword.isEmpty() && part.isNotEmpty()) keyword = part
             }
         }
         
         return FilterCondition(
             keyword = keyword,
             isRegex = isRegex,
+            isExact = isExact,
             excludeKeyword = excludeKeyword,
+            excludeIsRegex = excludeIsRegex,
+            excludeIsExact = excludeIsExact,
             minLevel = minLevel,
             showTx = showTx,
             showRx = showRx,
@@ -705,25 +779,45 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         }
     }
     
+    /**
+     * Logcat 风格日志格式:
+     * MM-dd HH:mm:ss.SSS  L/TAG  : content
+     * 例如: 01-22 10:25:02.962  D/TX   : Hello World
+     */
     private fun appendEntryToDisplay(entry: LogEntry) {
-        val style = when (entry.direction) {
-            "TX" -> txStyle
-            "RX" -> rxStyle
-            "SYS" -> sysStyle
-            "ERR" -> errStyle
-            else -> sysStyle
+        // 根据日志级别选择样式
+        val style = when (entry.level) {
+            LogLevel.VERBOSE -> verboseStyle
+            LogLevel.DEBUG -> debugStyle
+            LogLevel.INFO -> infoStyle
+            LogLevel.WARN -> warnStyle
+            LogLevel.ERROR -> errorStyle
         }
         
+        // 级别单字母标签 (Logcat 风格)
+        val levelChar = when (entry.level) {
+            LogLevel.VERBOSE -> 'V'
+            LogLevel.DEBUG -> 'D'
+            LogLevel.INFO -> 'I'
+            LogLevel.WARN -> 'W'
+            LogLevel.ERROR -> 'E'
+        }
+        
+        // 方向标签 (作为 Tag)
+        val tag = entry.direction.padEnd(3)
+        
+        // 内容处理
         val content = if (displayHex && entry.rawData != null) {
             entry.rawData.joinToString(" ") { "%02X".format(it) }
         } else {
             entry.content
         }
         
+        // Logcat 格式: MM-dd HH:mm:ss.SSS  L/TAG  : content
         val text = if (showTimestamp) {
-            "${entry.timestamp}  ${entry.direction.padEnd(3)}  $content\n"
+            "${entry.timestamp}  $levelChar/$tag : $content\n"
         } else {
-            "${entry.direction.padEnd(3)}  $content\n"
+            "$levelChar/$tag : $content\n"
         }
         
         try {
@@ -795,8 +889,9 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     private fun showInfo(msg: String) = JOptionPane.showMessageDialog(mainPanel, msg, "信息", JOptionPane.INFORMATION_MESSAGE)
     private fun showError(msg: String) = JOptionPane.showMessageDialog(mainPanel, msg, "错误", JOptionPane.ERROR_MESSAGE)
     
+    // Logcat 风格时间戳: MM-dd HH:mm:ss.SSS
     private fun getCurrentTime(): String = java.time.LocalDateTime.now()
-        .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"))
+        .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS"))
     
     // ========== SerialPortListener ==========
     
@@ -874,6 +969,9 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     // ========== LogFilterListener ==========
     
     override fun onEntryAdded(entry: LogEntry) {
+        // 暂停时不更新显示
+        if (isPaused) return
+        
         SwingUtilities.invokeLater {
             appendEntryToDisplay(entry)
             if (autoScroll) scrollToBottom()

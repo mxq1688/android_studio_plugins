@@ -40,12 +40,15 @@ data class LogEntry(
 }
 
 /**
- * 过滤条件数据类
+ * 过滤条件数据类 (Logcat 风格)
  */
 data class FilterCondition(
     val keyword: String = "",
     val isRegex: Boolean = false,
+    val isExact: Boolean = false,
     val excludeKeyword: String = "",
+    val excludeIsRegex: Boolean = false,
+    val excludeIsExact: Boolean = false,
     val minLevel: LogLevel = LogLevel.VERBOSE,
     val showTx: Boolean = true,
     val showRx: Boolean = true,
@@ -92,16 +95,30 @@ class LogFilterManager {
         }
     }
     
+    // 排除正则
+    private var excludeCompiledRegex: Regex? = null
+    
     /**
      * 设置活动过滤条件
      */
     fun setActiveFilter(filter: FilterCondition) {
         activeFilter = filter
         
-        // 编译正则表达式
+        // 编译包含正则表达式
         compiledRegex = if (filter.isRegex && filter.keyword.isNotEmpty()) {
             try {
                 Regex(filter.keyword, RegexOption.IGNORE_CASE)
+            } catch (e: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+        
+        // 编译排除正则表达式
+        excludeCompiledRegex = if (filter.excludeIsRegex && filter.excludeKeyword.isNotEmpty()) {
+            try {
+                Regex(filter.excludeKeyword, RegexOption.IGNORE_CASE)
             } catch (e: Exception) {
                 null
             }
@@ -130,21 +147,36 @@ class LogFilterManager {
     }
     
     /**
-     * 导出所有日志
+     * 导出所有日志 (Logcat 格式)
      */
     fun exportAllLogs(): String {
         return allEntries.joinToString("\n") { entry ->
-            "${entry.timestamp}  ${entry.direction}  ${entry.content}"
+            formatLogcatLine(entry)
         }
     }
     
     /**
-     * 导出过滤后的日志
+     * 导出过滤后的日志 (Logcat 格式)
      */
     fun exportFilteredLogs(): String {
         return getFilteredEntries().joinToString("\n") { entry ->
-            "${entry.timestamp}  ${entry.direction}  ${entry.content}"
+            formatLogcatLine(entry)
         }
+    }
+    
+    /**
+     * 格式化为 Logcat 风格: MM-dd HH:mm:ss.SSS  L/TAG  : content
+     */
+    private fun formatLogcatLine(entry: LogEntry): String {
+        val levelChar = when (entry.level) {
+            LogLevel.VERBOSE -> 'V'
+            LogLevel.DEBUG -> 'D'
+            LogLevel.INFO -> 'I'
+            LogLevel.WARN -> 'W'
+            LogLevel.ERROR -> 'E'
+        }
+        val tag = entry.direction.padEnd(3)
+        return "${entry.timestamp}  $levelChar/$tag : ${entry.content}"
     }
     
     /**
@@ -179,7 +211,7 @@ class LogFilterManager {
     // ========== 私有方法 ==========
     
     /**
-     * 检查条目是否匹配过滤条件
+     * 检查条目是否匹配过滤条件 (Logcat 风格)
      */
     private fun matchesFilter(entry: LogEntry): Boolean {
         // 检查方向过滤
@@ -194,19 +226,34 @@ class LogFilterManager {
             return false
         }
         
-        // 检查排除关键词
+        // 检查排除关键词 (Logcat 风格: -message:, -message=:, -message~:)
         if (activeFilter.excludeKeyword.isNotEmpty()) {
-            if (entry.content.contains(activeFilter.excludeKeyword, ignoreCase = true)) {
-                return false
+            val shouldExclude = when {
+                activeFilter.excludeIsRegex && excludeCompiledRegex != null -> {
+                    excludeCompiledRegex!!.containsMatchIn(entry.content)
+                }
+                activeFilter.excludeIsExact -> {
+                    entry.content.equals(activeFilter.excludeKeyword, ignoreCase = true)
+                }
+                else -> {
+                    entry.content.contains(activeFilter.excludeKeyword, ignoreCase = true)
+                }
             }
+            if (shouldExclude) return false
         }
         
-        // 检查关键词/正则匹配
+        // 检查包含关键词 (Logcat 风格: message:, message=:, message~:)
         if (activeFilter.keyword.isNotEmpty()) {
-            val matches = if (activeFilter.isRegex && compiledRegex != null) {
-                compiledRegex!!.containsMatchIn(entry.content)
-            } else {
-                entry.content.contains(activeFilter.keyword, ignoreCase = true)
+            val matches = when {
+                activeFilter.isRegex && compiledRegex != null -> {
+                    compiledRegex!!.containsMatchIn(entry.content)
+                }
+                activeFilter.isExact -> {
+                    entry.content.equals(activeFilter.keyword, ignoreCase = true)
+                }
+                else -> {
+                    entry.content.contains(activeFilter.keyword, ignoreCase = true)
+                }
             }
             if (!matches) return false
         }

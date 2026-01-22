@@ -158,9 +158,12 @@ class SerialPortService(private val project: Project) {
         try {
             disconnect()
             
+            // 提取纯端口名（去除描述信息，如 "COM14 (FT232R USB UART)" -> "COM14"）
+            val purePortName = portName.split(" ").firstOrNull() ?: portName
+            
             val ports = SerialPort.getCommPorts()
-            val port = ports.firstOrNull { it.systemPortName == portName }
-                ?: throw IOException("Port $portName not found")
+            val port = ports.firstOrNull { it.systemPortName == purePortName }
+                ?: throw IOException("Port $purePortName not found. Available ports: ${ports.map { it.systemPortName }}")
             
             this.baudRate = baudRate
             port.baudRate = baudRate
@@ -485,7 +488,8 @@ class SerialPortService(private val project: Project) {
     }
     
     private fun getCurrentTimestamp(): String {
-        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss.SSS"))
+        // Logcat 风格时间戳: MM-dd HH:mm:ss.SSS
+        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS"))
     }
     
     /**

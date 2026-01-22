@@ -35,6 +35,12 @@ tasks {
         sinceBuild.set("241")
         untilBuild.set("253.*")
     }
+    
+    // 启用热重载
+    runIde {
+        // 自动重载插件（修改代码后自动更新，无需重启）
+        autoReloadPlugins.set(true)
+    }
 
     signPlugin {
         certificateChain.set(System.getenv("CERTIFICATE_CHAIN"))
