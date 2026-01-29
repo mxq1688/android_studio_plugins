@@ -22,7 +22,8 @@ data class LogEntry(
     val direction: String,  // TX, RX, SYS, ERR
     val content: String,
     val level: LogLevel = LogLevel.DEBUG,
-    val rawData: ByteArray? = null
+    val rawData: ByteArray? = null,
+    val createdTime: Long = System.currentTimeMillis()  // 创建时间戳 (用于 age: 过滤)
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -52,7 +53,10 @@ data class FilterCondition(
     val minLevel: LogLevel = LogLevel.VERBOSE,
     val showTx: Boolean = true,
     val showRx: Boolean = true,
-    val showSystem: Boolean = true
+    val showSystem: Boolean = true,
+    val maxAgeMs: Long = 0,  // Logcat age: 过滤 (毫秒，0 表示不限制)
+    val onlyCrash: Boolean = false,  // Logcat is:crash
+    val onlyStacktrace: Boolean = false  // Logcat is:stacktrace
 )
 
 /**
@@ -214,6 +218,30 @@ class LogFilterManager {
      * 检查条目是否匹配过滤条件 (Logcat 风格)
      */
     private fun matchesFilter(entry: LogEntry): Boolean {
+        // 检查时间范围过滤 (Logcat age: 语法)
+        if (activeFilter.maxAgeMs > 0) {
+            val age = System.currentTimeMillis() - entry.createdTime
+            if (age > activeFilter.maxAgeMs) return false
+        }
+        
+        // 检查 is:crash 过滤 (Logcat 风格)
+        if (activeFilter.onlyCrash) {
+            val isCrash = entry.level == LogLevel.ERROR || 
+                entry.content.contains("crash", ignoreCase = true) ||
+                entry.content.contains("exception", ignoreCase = true) ||
+                entry.content.contains("fatal", ignoreCase = true)
+            if (!isCrash) return false
+        }
+        
+        // 检查 is:stacktrace 过滤 (Logcat 风格)
+        if (activeFilter.onlyStacktrace) {
+            val isStacktrace = entry.content.contains("at ") ||
+                entry.content.contains("Caused by:") ||
+                entry.content.startsWith("\t") ||
+                entry.content.matches(Regex("^\\s+at\\s+.*"))
+            if (!isStacktrace) return false
+        }
+        
         // 检查方向过滤
         when (entry.direction) {
             "TX" -> if (!activeFilter.showTx) return false
@@ -259,5 +287,25 @@ class LogFilterManager {
         }
         
         return true
+    }
+    
+    companion object {
+        /**
+         * 解析 Logcat age: 语法 (如 "5m", "1h", "30s")
+         * @return 毫秒数，0 表示无效
+         */
+        fun parseAge(ageStr: String): Long {
+            val trimmed = ageStr.trim().lowercase()
+            if (trimmed.isEmpty()) return 0
+            
+            val value = trimmed.dropLast(1).toLongOrNull() ?: return 0
+            return when (trimmed.last()) {
+                's' -> value * 1000              // 秒
+                'm' -> value * 60 * 1000        // 分钟
+                'h' -> value * 60 * 60 * 1000   // 小时
+                'd' -> value * 24 * 60 * 60 * 1000  // 天
+                else -> 0
+            }
+        }
     }
 }
