@@ -47,6 +47,8 @@ data class FilterCondition(
     val keyword: String = "",
     val isRegex: Boolean = false,
     val isExact: Boolean = false,
+    val matchCase: Boolean = false,
+    val isImplicitLine: Boolean = true,  // true=搜索整行, false=只搜索消息内容 (Logcat IMPLICIT_LINE vs MESSAGE)
     val excludeKeyword: String = "",
     val excludeIsRegex: Boolean = false,
     val excludeIsExact: Boolean = false,
@@ -111,7 +113,7 @@ class LogFilterManager {
         // 编译包含正则表达式
         compiledRegex = if (filter.isRegex && filter.keyword.isNotEmpty()) {
             try {
-                Regex(filter.keyword, RegexOption.IGNORE_CASE)
+                if (filter.matchCase) Regex(filter.keyword) else Regex(filter.keyword, RegexOption.IGNORE_CASE)
             } catch (e: Exception) {
                 null
             }
@@ -122,7 +124,7 @@ class LogFilterManager {
         // 编译排除正则表达式
         excludeCompiledRegex = if (filter.excludeIsRegex && filter.excludeKeyword.isNotEmpty()) {
             try {
-                Regex(filter.excludeKeyword, RegexOption.IGNORE_CASE)
+                if (filter.matchCase) Regex(filter.excludeKeyword) else Regex(filter.excludeKeyword, RegexOption.IGNORE_CASE)
             } catch (e: Exception) {
                 null
             }
@@ -261,26 +263,37 @@ class LogFilterManager {
                     excludeCompiledRegex!!.containsMatchIn(entry.content)
                 }
                 activeFilter.excludeIsExact -> {
-                    entry.content.equals(activeFilter.excludeKeyword, ignoreCase = true)
+                    entry.content.equals(activeFilter.excludeKeyword, ignoreCase = !activeFilter.matchCase)
                 }
                 else -> {
-                    entry.content.contains(activeFilter.excludeKeyword, ignoreCase = true)
+                    entry.content.contains(activeFilter.excludeKeyword, ignoreCase = !activeFilter.matchCase)
                 }
             }
             if (shouldExclude) return false
         }
         
-        // 检查包含关键词 (Logcat 风格: message:, message=:, message~:)
+        // 检查包含关键词 (Logcat 风格)
+        // isImplicitLine=true: 搜索整行 (时间戳+方向+消息)
+        // isImplicitLine=false: 只搜索消息内容 (message:xxx)
         if (activeFilter.keyword.isNotEmpty()) {
+            // 构建搜索目标
+            val searchTarget = if (activeFilter.isImplicitLine) {
+                // 整行：时间戳 + 方向 + 消息内容
+                "${entry.timestamp} ${entry.direction} ${entry.content}"
+            } else {
+                // 只搜索消息内容
+                entry.content
+            }
+            
             val matches = when {
                 activeFilter.isRegex && compiledRegex != null -> {
-                    compiledRegex!!.containsMatchIn(entry.content)
+                    compiledRegex!!.containsMatchIn(searchTarget)
                 }
                 activeFilter.isExact -> {
-                    entry.content.equals(activeFilter.keyword, ignoreCase = true)
+                    searchTarget.equals(activeFilter.keyword, ignoreCase = !activeFilter.matchCase)
                 }
                 else -> {
-                    entry.content.contains(activeFilter.keyword, ignoreCase = true)
+                    searchTarget.contains(activeFilter.keyword, ignoreCase = !activeFilter.matchCase)
                 }
             }
             if (!matches) return false

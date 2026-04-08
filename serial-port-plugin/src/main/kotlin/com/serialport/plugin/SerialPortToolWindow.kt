@@ -1,7 +1,12 @@
 package com.serialport.plugin
 
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.EDT
+import com.intellij.openapi.application.invokeLater
 import com.intellij.openapi.components.service
+import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
@@ -11,11 +16,22 @@ import com.intellij.ui.content.ContentFactory
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBList
 import com.intellij.ui.JBColor
+import com.intellij.ui.EditorTextField
+import com.intellij.ide.ui.laf.darcula.ui.DarculaTextBorder
+import com.intellij.util.ui.components.BorderLayoutPanel
+import com.serialport.plugin.messages.*
+import com.serialport.plugin.util.createSerialPortEditor
+import com.serialport.plugin.util.isCaretAtBottom
+import com.serialport.plugin.util.isScrollAtBottom
+import kotlinx.coroutines.*
 import java.awt.*
 import java.awt.datatransfer.StringSelection
 import java.awt.event.*
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import javax.swing.*
 import javax.swing.text.*
 import javax.swing.event.DocumentEvent
@@ -37,7 +53,7 @@ class SerialPortToolWindowFactory : ToolWindowFactory {
 /**
  * 串口工具窗口主界面 - Logcat 风格
  */
-class SerialPortToolWindow(private val project: Project) : SerialPortListener, PortChangeListener, LogFilterListener {
+class SerialPortToolWindow(private val project: Project) : SerialPortListener, PortChangeListener, LogFilterListener, Disposable {
     
     private val serialService = project.service<SerialPortService>()
     private val commandManager = project.service<CommandManager>()
@@ -45,6 +61,17 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     // UI Components
     private val mainPanel = JPanel(BorderLayout(0, 0))
+    
+    // EditorEx 和相关组件 (Logcat 风格)
+    private val editor: EditorEx = createSerialPortEditor(project, this)
+    private val document = editor.document
+    private val documentAppender: DocumentAppender
+    private val messageBacklog: MessageBacklog
+    private val messageFormatter: MessageFormatter
+    private val coroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    
+    // 缓冲区大小 (默认 1MB)
+    private val bufferSize = 1024 * 1024
     
     // 顶部栏组件
     private val portComboBox = JComboBox<String>()
@@ -55,9 +82,14 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     ))
     private val connectButton = JButton()
     
-    // Logcat 风格过滤器
-    private val filterField = JTextField(40)
+    // Logcat 风格过滤器 - 使用 EditorTextField
+    private lateinit var filterTextField: EditorTextField
     private var filterPopup: JBPopup? = null
+    private var filterMatchCase = false
+    
+    // 过滤器定时器 (用于延迟应用过滤和显示建议)
+    private var filterTimer: Timer? = null
+    private var suggestionTimer: Timer? = null
     
     // 过滤器历史记录 (Logcat 风格)
     private val filterHistory = mutableListOf<String>()
@@ -69,10 +101,6 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     // 日志级别下拉框 (Logcat 风格)
     private val logLevelComboBox = JComboBox(arrayOf("Verbose", "Debug", "Info", "Warn", "Error"))
-    
-    // 日志显示区
-    private val logArea = JTextPane()
-    private val logDocument: StyledDocument = logArea.styledDocument
     
     // 发送区
     private val sendField = JTextField()
@@ -86,17 +114,15 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     private var displayHex = false
     private var isCompactView = false  // Logcat: Standard View vs Compact View
     
-    // 方向颜色标签 (Logcat 风格)
-    private lateinit var txTagStyle: Style    // TX 发送 - 蓝色
-    private lateinit var rxTagStyle: Style    // RX 接收 - 绿色
-    private lateinit var sysTagStyle: Style   // SYS 系统 - 灰色
-    private lateinit var errTagStyle: Style   // ERR 错误 - 红色
-    
     // UI 引用 (用于状态同步)
     private var autoScrollBtn: JButton? = null
     private var pauseBtn: JButton? = null
     private var logScrollPane: JBScrollPane? = null
     private var statusLabel: JLabel? = null  // 状态栏统计显示
+    
+    // 滚动状态管理 (参考 Logcat)
+    private var ignoreCaretAtBottom = false
+    private var caretLine = 0
     
     // 搜索栏 (Ctrl+F)
     private var searchBar: JPanel? = null
@@ -111,13 +137,6 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     // 搜索历史记录
     private val searchHistory = mutableListOf<String>()
     private val maxSearchHistory = 20
-    
-    // Logcat 风格文本样式
-    private val verboseStyle: Style
-    private val debugStyle: Style
-    private val infoStyle: Style
-    private val warnStyle: Style
-    private val errorStyle: Style
     
     // Logcat 风格过滤器语法提示
     private val filterSuggestions = listOf(
@@ -146,45 +165,13 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     data class FilterSuggestion(val syntax: String, val description: String, val example: String)
     
     init {
-        // 初始化 Logcat 风格样式
-        val defaultStyle = StyleContext.getDefaultStyleContext().getStyle(StyleContext.DEFAULT_STYLE)
+        // 初始化消息处理组件
+        documentAppender = DocumentAppender(project, document, bufferSize)
+        messageBacklog = MessageBacklog(bufferSize)
+        messageFormatter = MessageFormatter(ZoneId.systemDefault())
         
-        // V - Verbose: 灰色
-        verboseStyle = logArea.addStyle("VERBOSE", defaultStyle)
-        StyleConstants.setForeground(verboseStyle, JBColor(Color(128, 128, 128), Color(150, 150, 150)))
-        
-        // D - Debug: 蓝色
-        debugStyle = logArea.addStyle("DEBUG", defaultStyle)
-        StyleConstants.setForeground(debugStyle, JBColor(Color(0, 102, 204), Color(86, 156, 214)))
-        
-        // I - Info: 绿色
-        infoStyle = logArea.addStyle("INFO", defaultStyle)
-        StyleConstants.setForeground(infoStyle, JBColor(Color(0, 128, 0), Color(78, 201, 176)))
-        
-        // W - Warn: 橙色/黄色
-        warnStyle = logArea.addStyle("WARN", defaultStyle)
-        StyleConstants.setForeground(warnStyle, JBColor(Color(187, 134, 0), Color(220, 180, 80)))
-        
-        // E - Error: 红色
-        errorStyle = logArea.addStyle("ERROR", defaultStyle)
-        StyleConstants.setForeground(errorStyle, JBColor(Color(187, 0, 0), Color(244, 108, 108)))
-        
-        // 方向颜色标签样式 (Logcat 风格 - 不同标签不同颜色)
-        txTagStyle = logArea.addStyle("TX_TAG", defaultStyle)
-        StyleConstants.setForeground(txTagStyle, JBColor(Color(65, 105, 225), Color(100, 149, 237)))  // 蓝色
-        StyleConstants.setBold(txTagStyle, true)
-        
-        rxTagStyle = logArea.addStyle("RX_TAG", defaultStyle)
-        StyleConstants.setForeground(rxTagStyle, JBColor(Color(34, 139, 34), Color(50, 205, 50)))    // 绿色
-        StyleConstants.setBold(rxTagStyle, true)
-        
-        sysTagStyle = logArea.addStyle("SYS_TAG", defaultStyle)
-        StyleConstants.setForeground(sysTagStyle, JBColor(Color(128, 128, 128), Color(169, 169, 169)))  // 灰色
-        StyleConstants.setBold(sysTagStyle, true)
-        
-        errTagStyle = logArea.addStyle("ERR_TAG", defaultStyle)
-        StyleConstants.setForeground(errTagStyle, JBColor(Color(220, 20, 60), Color(255, 99, 71)))   // 红色
-        StyleConstants.setBold(errTagStyle, true)
+        // 初始化编辑器设置
+        initEditorSettings()
         
         setupUI()
         setupListeners()
@@ -192,6 +179,64 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         serialService.addPortChangeListener(this)
         filterManager.addListener(this)
         refreshPortList()
+    }
+    
+    /**
+     * 初始化编辑器设置
+     */
+    private fun initEditorSettings() {
+        editor.settings.isUseSoftWraps = false
+        messageFormatter.setSoftWrapEnabled(false)
+        
+        // 监听光标位置变化
+        editor.caretModel.addCaretListener(object : com.intellij.openapi.editor.event.CaretListener {
+            override fun caretPositionChanged(event: com.intellij.openapi.editor.event.CaretEvent) {
+                caretLine = event.newPosition.line
+            }
+        })
+        
+        // 初始化滚动到底部状态处理
+        initScrollToEndStateHandling()
+    }
+    
+    /**
+     * 初始化滚动到底部状态处理 (参考 Logcat)
+     */
+    private fun initScrollToEndStateHandling() {
+        val mouseListener = object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) {
+                updateScrollToEndState(true)
+            }
+            
+            override fun mouseDragged(e: MouseEvent) {
+                updateScrollToEndState(false)
+            }
+            
+            override fun mouseWheelMoved(e: MouseWheelEvent) {
+                if (e.isShiftDown) return // 忽略水平滚动
+                updateScrollToEndState(false)
+            }
+        }
+        val scrollPane = editor.scrollPane
+        scrollPane.addMouseWheelListener(mouseListener)
+        scrollPane.verticalScrollBar.addMouseListener(mouseListener)
+        scrollPane.verticalScrollBar.addMouseMotionListener(mouseListener)
+    }
+    
+    /**
+     * 更新滚动到底部状态 (参考 Logcat)
+     */
+    private fun updateScrollToEndState(useImmediatePosition: Boolean) {
+        val scrollAtBottom = editor.isScrollAtBottom(useImmediatePosition)
+        val caretAtBottom = editor.isCaretAtBottom()
+        if (!scrollAtBottom && caretAtBottom) {
+            ignoreCaretAtBottom = true
+        }
+    }
+    
+    override fun dispose() {
+        coroutineScope.cancel()
+        com.intellij.openapi.editor.EditorFactory.getInstance().releaseEditor(editor)
     }
     
     fun getContent(): JComponent = mainPanel
@@ -223,21 +268,19 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     /**
      * 创建 Logcat 风格顶部栏 (设备选择 + 过滤器)
+     * 使用 GroupLayout 布局，参考 LogcatHeaderPanel
      */
     private fun createLogcatTopBar(): JPanel {
-        val panel = JPanel(BorderLayout(8, 0))
+        val panel = JPanel()
+        panel.background = JBColor.background()
         panel.border = BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(0, 0, 1, 0, JBColor.border()),
-            BorderFactory.createEmptyBorder(4, 6, 4, 6)
+            BorderFactory.createEmptyBorder(4, 8, 4, 8)
         )
-        panel.background = JBColor.background()
         
-        // === 左侧：设备选择 (Logcat: "No connected devices") ===
-        val devicePanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        devicePanel.isOpaque = false
-        
-        portComboBox.preferredSize = Dimension(200, 26)
-        portComboBox.minimumSize = Dimension(150, 26)
+        // 配置组件
+        portComboBox.preferredSize = Dimension(200, 28)
+        portComboBox.minimumSize = Dimension(150, 28)
         portComboBox.toolTipText = "选择串口"
         portComboBox.renderer = object : DefaultListCellRenderer() {
             override fun getListCellRendererComponent(
@@ -248,9 +291,8 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                 return this
             }
         }
-        devicePanel.add(portComboBox)
         
-        baudRateComboBox.preferredSize = Dimension(90, 26)
+        baudRateComboBox.preferredSize = Dimension(96, 28)
         baudRateComboBox.selectedItem = "115200"
         baudRateComboBox.toolTipText = "波特率"
         baudRateComboBox.isEditable = true
@@ -267,66 +309,50 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                 }
             })
         }
-        devicePanel.add(baudRateComboBox)
         
-        connectButton.preferredSize = Dimension(50, 26)
+        connectButton.preferredSize = Dimension(56, 28)
         updateConnectButton()
+        
+        // 顶部保留串口核心控制（设备 + 波特率 + 连接）
+        val devicePanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        devicePanel.isOpaque = false
+        devicePanel.add(portComboBox)
+        devicePanel.add(baudRateComboBox)
+        connectButton.isFocusPainted = false
+        connectButton.margin = Insets(2, 8, 2, 8)
         devicePanel.add(connectButton)
         
-        panel.add(devicePanel, BorderLayout.WEST)
+        // 创建 Logcat 风格的过滤器输入框 (使用 BorderLayoutPanel + EditorTextField)
+        val filterPanel = createLogcatFilterTextField()
         
-        // === 中间：过滤器 (Logcat 核心: "Press Ctrl+空格 to see suggestions") ===
-        val filterPanel = JPanel(BorderLayout(2, 0))
-        filterPanel.isOpaque = false
-        filterPanel.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(JBColor.border(), 1, true),
-            BorderFactory.createEmptyBorder(0, 6, 0, 2)
+        // 使用 GroupLayout 布局
+        val layout = GroupLayout(panel)
+        layout.autoCreateContainerGaps = true
+        layout.autoCreateGaps = true
+        
+        val helpIcon = JLabel(AllIcons.General.ContextHelp).apply {
+            toolTipText = "Filter syntax help"
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent?) = showFilterHelp()
+            })
+        }
+
+        layout.setHorizontalGroup(
+            layout.createSequentialGroup()
+                .addComponent(devicePanel, GroupLayout.PREFERRED_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
+                .addComponent(filterPanel, com.intellij.util.ui.JBUI.scale(420), GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE)
+                .addComponent(helpIcon)
         )
         
-        // 过滤历史按钮 (Logcat 风格: 点击漏斗图标显示历史记录)
-        val filterHistoryIcon = JButton(AllIcons.General.Filter)
-        filterHistoryIcon.preferredSize = Dimension(24, 24)
-        filterHistoryIcon.isBorderPainted = false
-        filterHistoryIcon.isContentAreaFilled = false
-        filterHistoryIcon.toolTipText = "过滤历史记录 (点击显示)"
-        filterHistoryIcon.addActionListener { showFilterSuggestions() }
-        filterPanel.add(filterHistoryIcon, BorderLayout.WEST)
+        layout.setVerticalGroup(
+            layout.createParallelGroup(GroupLayout.Alignment.CENTER)
+                .addComponent(devicePanel, GroupLayout.PREFERRED_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
+                .addComponent(filterPanel, GroupLayout.PREFERRED_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
+                .addComponent(helpIcon)
+        )
         
-        filterField.border = BorderFactory.createEmptyBorder(2, 6, 2, 6)
-        filterField.font = Font(Font.MONOSPACED, Font.PLAIN, 12)
-        filterField.putClientProperty("JTextField.placeholderText", "Press Ctrl+空格 to see suggestions")
-        filterPanel.add(filterField, BorderLayout.CENTER)
-        
-        panel.add(filterPanel, BorderLayout.CENTER)
-        
-        // === 右侧：只有星标收藏按钮 (Logcat 风格) ===
-        val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 2, 0))
-        rightPanel.isOpaque = false
-        
-        // 收藏/星标按钮 (Logcat 风格: 点击收藏当前过滤条件)
-        val starBtn = JButton(AllIcons.Nodes.NotFavoriteOnHover)
-        starBtn.preferredSize = Dimension(24, 24)
-        starBtn.isBorderPainted = false
-        starBtn.isContentAreaFilled = false
-        starBtn.toolTipText = "收藏当前过滤条件 (★)"
-        starBtn.addActionListener { toggleFavorite() }
-        favoriteBtn = starBtn
-        rightPanel.add(starBtn)
-        
-        // 更新星标状态
-        filterField.document.addDocumentListener(object : DocumentListener {
-            override fun insertUpdate(e: DocumentEvent) = updateFavoriteIcon()
-            override fun removeUpdate(e: DocumentEvent) = updateFavoriteIcon()
-            override fun changedUpdate(e: DocumentEvent) = updateFavoriteIcon()
-            private fun updateFavoriteIcon() {
-                val currentFilter = filterField.text.trim()
-                val isFavorite = filterFavorites.contains(currentFilter)
-                favoriteBtn?.icon = if (isFavorite) AllIcons.Nodes.Favorite else AllIcons.Nodes.NotFavoriteOnHover
-            }
-        })
-        
-        panel.add(rightPanel, BorderLayout.EAST)
-        
+        panel.layout = layout
         return panel
     }
     
@@ -334,16 +360,59 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      * 创建 Logcat 风格左侧垂直工具栏
      */
     /**
+     * 将 LogEntry 转换为 SerialPortMessage
+     */
+    private fun LogEntry.toSerialPortMessage(): SerialPortMessage {
+        val direction = when (this.direction) {
+            "TX" -> SerialPortMessage.Direction.TX
+            "RX" -> SerialPortMessage.Direction.RX
+            "SYS" -> SerialPortMessage.Direction.SYS
+            "ERR" -> SerialPortMessage.Direction.ERR
+            else -> SerialPortMessage.Direction.SYS
+        }
+        
+        val level = when (this.level) {
+            LogLevel.VERBOSE -> SerialPortMessage.LogLevel.VERBOSE
+            LogLevel.DEBUG -> SerialPortMessage.LogLevel.DEBUG
+            LogLevel.INFO -> SerialPortMessage.LogLevel.INFO
+            LogLevel.WARN -> SerialPortMessage.LogLevel.WARN
+            LogLevel.ERROR -> SerialPortMessage.LogLevel.ERROR
+        }
+        
+        // 解析时间戳
+        val instant = try {
+            val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            java.time.LocalDateTime.parse(this.timestamp, formatter)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+        } catch (e: Exception) {
+            Instant.ofEpochMilli(this.createdTime)
+        }
+        
+        return SerialPortMessage(
+            timestamp = instant,
+            direction = direction,
+            level = level,
+            content = this.content,
+            rawBytes = this.rawData
+        )
+    }
+    
+    /**
      * 创建 Logcat 风格左侧工具栏 (参考截图布局)
      */
     private fun createLogcatLeftToolbar(): JPanel {
         val toolbar = JPanel()
         toolbar.layout = BoxLayout(toolbar, BoxLayout.Y_AXIS)
-        toolbar.border = BorderFactory.createMatteBorder(0, 0, 0, 1, JBColor.border())
+        // Logcat 风格的边框：右侧边框
+        toolbar.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 0, 1, JBColor.border()),
+            BorderFactory.createEmptyBorder(4, 2, 4, 2)
+        )
         toolbar.background = JBColor.background()
-        toolbar.preferredSize = Dimension(28, 0)
+        toolbar.preferredSize = Dimension(32, 0)
         
-        toolbar.add(Box.createVerticalStrut(2))
+        toolbar.add(Box.createVerticalStrut(4))
         
         // === 第一组：基本操作 ===
         
@@ -391,11 +460,12 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         pageUpBtn.addActionListener { 
             autoScroll = false
             updateToggleButton(autoScrollBtn!!, autoScroll)
-            val viewport = logScrollPane?.viewport
+            val scrollPane = editor.scrollPane
+            val viewport = scrollPane.viewport
             viewport?.let {
                 val rect = it.viewRect
                 rect.y = maxOf(0, rect.y - rect.height)
-                logArea.scrollRectToVisible(rect)
+                editor.contentComponent.scrollRectToVisible(rect)
             }
         }
         toolbar.add(pageUpBtn)
@@ -403,11 +473,12 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         // 7. 向下翻页
         val pageDownBtn = createLeftToolbarButton(AllIcons.Actions.MoveDown, "向下翻页")
         pageDownBtn.addActionListener { 
-            val viewport = logScrollPane?.viewport
+            val scrollPane = editor.scrollPane
+            val viewport = scrollPane.viewport
             viewport?.let {
                 val rect = it.viewRect
-                rect.y = minOf(logArea.height - rect.height, rect.y + rect.height)
-                logArea.scrollRectToVisible(rect)
+                rect.y = minOf(editor.contentComponent.height - rect.height, rect.y + rect.height)
+                editor.contentComponent.scrollRectToVisible(rect)
             }
         }
         toolbar.add(pageDownBtn)
@@ -475,9 +546,9 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         // 12. 复制全部
         val copyBtn = createLeftToolbarButton(AllIcons.Actions.Copy, "复制全部日志")
         copyBtn.addActionListener { 
-            logArea.selectAll()
-            logArea.copy()
-            logArea.select(0, 0)
+            editor.selectionModel.setSelection(0, document.textLength)
+            editor.selectionModel.copySelectionToClipboard()
+            editor.selectionModel.removeSelection()
         }
         toolbar.add(copyBtn)
         
@@ -509,34 +580,58 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     private fun createLeftToolbarButton(icon: Icon, tooltip: String): JButton {
         return JButton(icon).apply {
-            preferredSize = Dimension(24, 24)
-            maximumSize = Dimension(24, 24)
-            minimumSize = Dimension(24, 24)
+            preferredSize = Dimension(28, 28)
+            maximumSize = Dimension(28, 28)
+            minimumSize = Dimension(28, 28)
             toolTipText = tooltip
             isBorderPainted = false
             isContentAreaFilled = false
             isFocusPainted = false
             alignmentX = Component.CENTER_ALIGNMENT
+            // Logcat 风格的按钮悬停效果
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent) {
+                    background = JBColor(Color(60, 63, 65), Color(50, 52, 54))
+                }
+                override fun mouseExited(e: MouseEvent) {
+                    background = JBColor.background()
+                }
+            })
         }
     }
     
     private fun createLeftToolbarToggleButton(icon: Icon, tooltip: String, selected: Boolean): JButton {
         return JButton(icon).apply {
-            preferredSize = Dimension(24, 24)
-            maximumSize = Dimension(24, 24)
-            minimumSize = Dimension(24, 24)
+            preferredSize = Dimension(28, 28)
+            maximumSize = Dimension(28, 28)
+            minimumSize = Dimension(28, 28)
             toolTipText = tooltip
-            isBorderPainted = true
+            isBorderPainted = false
             isContentAreaFilled = false
             isFocusPainted = false
             alignmentX = Component.CENTER_ALIGNMENT
             updateToggleButton(this, selected)
+            // Logcat 风格的按钮悬停效果
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent) {
+                    if (!selected) {
+                        background = JBColor(Color(60, 63, 65), Color(50, 52, 54))
+                    }
+                }
+                override fun mouseExited(e: MouseEvent) {
+                    if (!selected) {
+                        background = JBColor.background()
+                    }
+                }
+            })
         }
     }
     
     private fun createHorizontalSeparator(): JSeparator {
         return JSeparator(SwingConstants.HORIZONTAL).apply {
-            maximumSize = Dimension(24, 1)
+            maximumSize = Dimension(28, 1)
+            preferredSize = Dimension(28, 1)
+            background = JBColor.border()
         }
     }
     
@@ -572,6 +667,120 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     
     
     /**
+     * 创建 Logcat 风格的过滤器输入框 (参考 FilterTextField)
+     */
+    private fun createLogcatFilterTextField(): BorderLayoutPanel {
+        // 创建 EditorTextField (使用 PlainTextFileType)
+        filterTextField = EditorTextField(project, com.intellij.openapi.fileTypes.PlainTextFileType.INSTANCE)
+        filterTextField.setPlaceholder("Press Ctrl+Space to see suggestions")
+        filterTextField.setShowPlaceholderWhenFocused(true)
+        filterTextField.border = com.intellij.util.ui.JBUI.Borders.empty()
+        
+        // 左侧过滤图标（Logcat 风格）
+        val filterIcon = createInlineButton(AllIcons.General.Filter, "Filter syntax", filterTextField)
+        filterIcon.border = com.intellij.util.ui.JBUI.Borders.empty(0, 5, 0, 4)
+        filterIcon.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) = showFilterSuggestions()
+        })
+        
+        // 清除按钮 (参考 Logcat ClearButton)
+        val clearButton = createInlineButton(AllIcons.Actions.Close, "Clear filter", filterTextField)
+        clearButton.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                filterTextField.text = ""
+                // 立即应用空过滤器
+                applyFilter()
+            }
+        })
+        
+        val caseBtn = JButton("Cc").apply {
+            toolTipText = "Match case"
+            preferredSize = Dimension(28, 20)
+            isBorderPainted = false
+            isContentAreaFilled = false
+            isFocusPainted = false
+            foreground = JBColor.GRAY
+            border = com.intellij.util.ui.JBUI.Borders.empty(0, 3)
+        }
+        caseBtn.addActionListener {
+            filterMatchCase = !filterMatchCase
+            caseBtn.foreground = if (filterMatchCase) {
+                JBColor(Color(88, 157, 246), Color(88, 157, 246))
+            } else {
+                JBColor.GRAY
+            }
+            applyFilter()
+        }
+        
+        // 右侧按钮面板
+        val buttonPanel = createInlinePanel(clearButton, caseBtn)
+        
+        // 更新收藏按钮状态和按钮可见性
+        filterTextField.addDocumentListener(object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                val hasFilter = event.document.text.isNotEmpty()
+                clearButton.isVisible = hasFilter
+            }
+        })
+        
+        // 创建 BorderLayoutPanel (Logcat 风格)
+        val filterPanel = object : BorderLayoutPanel() {
+            override fun updateUI() {
+                super.updateUI()
+                // 更新背景色以匹配主题
+                background = JBColor.background()
+            }
+        }
+        
+        filterPanel.addToLeft(filterIcon)
+        filterPanel.addToCenter(filterTextField)
+        filterPanel.addToRight(buttonPanel)
+        
+        // Logcat 风格的边框
+        filterPanel.border = BorderFactory.createLineBorder(JBColor.border(), 1)
+        
+        return filterPanel
+    }
+    
+    private fun createInlineButton(icon: Icon, tooltip: String, textField: EditorTextField): JLabel {
+        return object : JLabel(icon) {
+            init {
+                isOpaque = false
+                toolTipText = tooltip
+            }
+            
+            override fun updateUI() {
+                background = textField.background
+                super.updateUI()
+            }
+        }
+    }
+    
+    private fun createInlinePanel(vararg children: JComponent): JPanel {
+        return object : JPanel(null) {
+            init {
+                layout = BoxLayout(this, BoxLayout.LINE_AXIS)
+                isOpaque = false
+                border = com.intellij.util.ui.JBUI.Borders.empty(0, 2)
+                children.forEach {
+                    it.border = com.intellij.util.ui.JBUI.Borders.empty(0, 2)
+                    add(it)
+                }
+            }
+            
+            override fun updateUI() {
+                super.updateUI()
+            }
+        }
+    }
+    
+    private inner class FilterTextFieldBorder : DarculaTextBorder() {
+        override fun isFocused(c: Component?): Boolean {
+            return filterTextField.editor?.contentComponent?.hasFocus() == true
+        }
+    }
+    
+    /**
      * 显示过滤器语法下拉提示 (Logcat 风格)
      */
     /**
@@ -581,7 +790,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      * 切换收藏状态 (Logcat 星标功能)
      */
     private fun toggleFavorite() {
-        val currentFilter = filterField.text.trim()
+        val currentFilter = filterTextField.text.trim()
         if (currentFilter.isEmpty()) return
         
         if (filterFavorites.contains(currentFilter)) {
@@ -893,10 +1102,10 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                         deleteBtn.isVisible = false
                     }
                     override fun mouseClicked(e: MouseEvent?) {
-                        filterField.text = item.filterText
-                        filterField.caretPosition = filterField.text.length
+                        filterTextField.text = item.filterText
+                        filterTextField.editor?.caretModel?.moveToOffset(filterTextField.text.length)
                         filterPopup?.cancel()
-                        applyFilter()
+                        this@SerialPortToolWindow.applyFilter()
                     }
                 })
                 
@@ -983,10 +1192,10 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                     }
                     KeyEvent.VK_ENTER -> {
                         if (selectableItems.isNotEmpty() && currentSelectedIndex >= 0 && currentSelectedIndex < selectableTexts.size) {
-                            filterField.text = selectableTexts[currentSelectedIndex]
-                            filterField.caretPosition = filterField.text.length
+                            filterTextField.text = selectableTexts[currentSelectedIndex]
+                            filterTextField.editor?.caretModel?.moveToOffset(filterTextField.text.length)
                             filterPopup?.cancel()
-                            applyFilter()
+                            this@SerialPortToolWindow.applyFilter()
                         }
                         e.consume()
                     }
@@ -1027,10 +1236,10 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                     }
                     KeyEvent.VK_ENTER -> {
                         if (selectableItems.isNotEmpty() && currentSelectedIndex >= 0 && currentSelectedIndex < selectableTexts.size) {
-                            filterField.text = selectableTexts[currentSelectedIndex]
-                            filterField.caretPosition = filterField.text.length
+                            filterTextField.text = selectableTexts[currentSelectedIndex]
+                            filterTextField.editor?.caretModel?.moveToOffset(filterTextField.text.length)
                             filterPopup?.cancel()
-                            applyFilter()
+                            this@SerialPortToolWindow.applyFilter()
                         }
                         e.consume()
                     }
@@ -1049,14 +1258,14 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             .setRequestFocus(true)
             .createPopup()
         
-        filterPopup?.showUnderneathOf(filterField)
+        filterPopup?.showUnderneathOf(filterTextField)
     }
     
     /**
      * 更新收藏按钮状态
      */
     private fun updateFavoriteButtonState() {
-        val currentFilter = filterField.text.trim()
+        val currentFilter = filterTextField.text.trim()
         val isFavorite = filterFavorites.contains(currentFilter)
         favoriteBtn?.icon = if (isFavorite) AllIcons.Nodes.Favorite else AllIcons.Nodes.NotFavoriteOnHover
     }
@@ -1065,7 +1274,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      * 计算日志中某个过滤条件的匹配数量
      */
     private fun countMatches(filterText: String): Int {
-        val text = logArea.text
+        val text = document.text
         if (text.isEmpty() || filterText.isEmpty()) return 0
         return try {
             Regex.escape(filterText).toRegex(RegexOption.IGNORE_CASE).findAll(text).count()
@@ -1153,7 +1362,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             .setRequestFocus(false)
             .createPopup()
         
-        filterPopup?.showUnderneathOf(filterField)
+        filterPopup?.showUnderneathOf(filterTextField)
     }
     
     private fun showFilterSyntaxHelp() {
@@ -1219,8 +1428,8 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                     itemPanel.background = bgColor
                 }
                 override fun mouseClicked(e: MouseEvent?) {
-                    filterField.text = suggestion.syntax
-                    filterField.caretPosition = filterField.text.length
+                    filterTextField.text = suggestion.syntax
+                    filterTextField.editor?.caretModel?.moveToOffset(filterTextField.text.length)
                     filterPopup?.cancel()
                 }
             })
@@ -1249,7 +1458,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             .setRequestFocus(true)
             .createPopup()
         
-        filterPopup?.showUnderneathOf(filterField)
+        filterPopup?.showUnderneathOf(filterTextField)
     }
     
     /**
@@ -1278,10 +1487,15 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     }
     
     /**
+     * 自动补全建议项 (Logcat 风格)
+     */
+    data class CompletionItem(val text: String, val hint: String?)
+    
+    /**
      * 根据输入自动显示匹配的建议 (Logcat 风格自动补全)
      */
     private fun showAutoCompleteSuggestions() {
-        val text = filterField.text
+        val text = filterTextField.text
         if (text.isEmpty()) {
             filterPopup?.cancel()
             return
@@ -1297,33 +1511,75 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         }
         
         // 过滤匹配的建议（历史记录 + 语法）
-        val matchedItems = mutableListOf<String>()
+        val matchedItems = mutableListOf<CompletionItem>()
+        
+        // 匹配语法建议 (带提示)
+        filterSuggestions.filter { it.syntax.startsWith(currentWord, ignoreCase = true) }
+            .forEach { matchedItems.add(CompletionItem(it.syntax, it.description)) }
         
         // 匹配历史记录
         filterHistory.filter { it.contains(currentWord, ignoreCase = true) }
-            .forEach { matchedItems.add(it) }
-        
-        // 匹配语法
-        filterSuggestions.filter { it.syntax.startsWith(currentWord, ignoreCase = true) }
-            .forEach { if (!matchedItems.contains(it.syntax)) matchedItems.add(it.syntax) }
+            .forEach { 
+                if (matchedItems.none { item -> item.text == it }) {
+                    matchedItems.add(CompletionItem(it, "History"))
+                }
+            }
         
         if (matchedItems.isEmpty()) {
             filterPopup?.cancel()
             return
         }
         
-        // 显示自动补全弹窗
+        // 显示自动补全弹窗 (Logcat 风格)
         filterPopup?.cancel()
         
-        val listModel = DefaultListModel<String>()
+        val listModel = DefaultListModel<CompletionItem>()
         matchedItems.forEach { listModel.addElement(it) }
         
         val list = JBList(listModel)
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        list.font = Font(Font.MONOSPACED, Font.PLAIN, 12)
         list.background = JBColor(Color(43, 43, 43), Color(43, 43, 43))
         list.foreground = JBColor(Color(187, 187, 187), Color(187, 187, 187))
         if (listModel.size() > 0) list.selectedIndex = 0
+        
+        // Logcat 风格的渲染器 (显示语法 + 提示)
+        list.cellRenderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: JList<*>?,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean
+            ): java.awt.Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                
+                val item = value as? CompletionItem ?: return this
+                
+                // 创建带语法和提示的面板
+                val panel = JPanel(BorderLayout())
+                panel.isOpaque = true
+                panel.background = if (isSelected) {
+                    JBColor(Color(45, 91, 138), Color(45, 91, 138))
+                } else {
+                    JBColor(Color(43, 43, 43), Color(43, 43, 43))
+                }
+                
+                val textLabel = JLabel(item.text)
+                textLabel.font = Font(Font.MONOSPACED, Font.PLAIN, 12)
+                textLabel.foreground = if (isSelected) Color.WHITE else JBColor(Color(187, 187, 187), Color(187, 187, 187))
+                textLabel.border = BorderFactory.createEmptyBorder(2, 8, 2, 8)
+                
+                val hintLabel = JLabel(item.hint ?: "")
+                hintLabel.font = Font(Font.SANS_SERIF, Font.PLAIN, 11)
+                hintLabel.foreground = JBColor(Color(128, 128, 128), Color(120, 120, 120))
+                hintLabel.border = BorderFactory.createEmptyBorder(2, 8, 2, 8)
+                
+                panel.add(textLabel, BorderLayout.WEST)
+                panel.add(hintLabel, BorderLayout.EAST)
+                
+                return panel
+            }
+        }
         
         filterPopup = JBPopupFactory.getInstance()
             .createListPopupBuilder(list)
@@ -1331,20 +1587,21 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             .setResizable(false)
             .setRequestFocus(false)
             .setItemChosenCallback { selected ->
-                val currentText = filterField.text
-                val lastSpaceIndex = currentText.lastIndexOf(' ')
-                val newText = if (lastSpaceIndex >= 0) {
-                    currentText.substring(0, lastSpaceIndex + 1) + (selected as String)
+                val item = selected as? CompletionItem ?: return@setItemChosenCallback
+                val currentText = filterTextField.text
+                val lastSpaceIdx = currentText.lastIndexOf(' ')
+                val newText = if (lastSpaceIdx >= 0) {
+                    currentText.substring(0, lastSpaceIdx + 1) + item.text
                 } else {
-                    selected as String
+                    item.text
                 }
-                filterField.text = newText
-                filterField.caretPosition = newText.length
-                filterField.requestFocus()
+                filterTextField.text = newText
+                filterTextField.editor?.caretModel?.moveToOffset(newText.length)
+                filterTextField.requestFocus()
             }
             .createPopup()
         
-        filterPopup?.showUnderneathOf(filterField)
+        filterPopup?.showUnderneathOf(filterTextField)
     }
     
     private fun updateToggleButton(button: JButton, selected: Boolean) {
@@ -1366,34 +1623,24 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         searchBar!!.isVisible = false
         panel.add(searchBar, BorderLayout.NORTH)
         
-        logArea.isEditable = false
-        logArea.font = Font("JetBrains Mono", Font.PLAIN, 12).let { 
-            if (it.family == "JetBrains Mono") it else Font(Font.MONOSPACED, Font.PLAIN, 12)
-        }
-        logArea.background = JBColor(Color(43, 43, 43), Color(43, 43, 43))
-        logArea.foreground = JBColor(Color(187, 187, 187), Color(187, 187, 187))
+        // 使用 EditorEx 替代 JTextPane (Logcat 风格)
+        logScrollPane = JBScrollPane(editor.component)
+        // Logcat 风格的边框：顶部有边框线
+        logScrollPane!!.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor.border()),
+            BorderFactory.createEmptyBorder()
+        )
         
-        logScrollPane = JBScrollPane(logArea)
-        logScrollPane!!.border = BorderFactory.createEmptyBorder()
-        
-        // 使用鼠标滚轮监听检测用户手动滚动
-        logScrollPane!!.addMouseWheelListener { e ->
-            if (e.wheelRotation < 0 && autoScroll) {
-                // 用户向上滚动（wheelRotation < 0 表示向上）
-                autoScroll = false
-                autoScrollBtn?.let { updateToggleButton(it, autoScroll) }
+        // Keep auto-scroll state synced with viewport position.
+        // If user scrolls up -> autoScroll=false; scrolls back to bottom -> autoScroll=true.
+        logScrollPane!!.verticalScrollBar.addAdjustmentListener {
+            val bar = logScrollPane!!.verticalScrollBar
+            val atBottom = bar.value + bar.visibleAmount >= bar.maximum - 2
+            if (autoScroll != atBottom) {
+                autoScroll = atBottom
+                autoScrollBtn?.let { btn -> updateToggleButton(btn, autoScroll) }
             }
         }
-        
-        // 鼠标拖动滚动条也算手动滚动
-        logScrollPane!!.verticalScrollBar.addMouseListener(object : MouseAdapter() {
-            override fun mousePressed(e: MouseEvent?) {
-                if (autoScroll) {
-                    autoScroll = false
-                    autoScrollBtn?.let { updateToggleButton(it, autoScroll) }
-                }
-            }
-        })
         
         panel.add(logScrollPane, BorderLayout.CENTER)
         return panel
@@ -1591,7 +1838,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             return
         }
         
-        val text = logArea.text
+        val text = document.text
         val pattern = try {
             when {
                 useRegex -> searchText.toRegex(if (caseSensitive) setOf() else setOf(RegexOption.IGNORE_CASE))
@@ -1622,11 +1869,21 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      * 高亮搜索结果
      */
     private fun highlightSearchResult(start: Int, end: Int) {
-        val highlighter = logArea.highlighter
+        val markupModel = com.intellij.openapi.editor.impl.DocumentMarkupModel.forDocument(document, project, true)
         try {
-            highlighter.addHighlight(start, end, javax.swing.text.DefaultHighlighter.DefaultHighlightPainter(
-                JBColor(Color(255, 200, 0, 100), Color(100, 100, 0, 150))
-            ))
+            markupModel.addRangeHighlighter(
+                start,
+                end,
+                com.intellij.openapi.editor.markup.HighlighterLayer.SELECTION - 1, // 使用 SELECTION 层之前的一层
+                com.intellij.openapi.editor.markup.TextAttributes(
+                    null,
+                    JBColor(Color(255, 200, 0, 100), Color(100, 100, 0, 150)),
+                    null,
+                    null,
+                    0
+                ),
+                com.intellij.openapi.editor.markup.HighlighterTargetArea.EXACT_RANGE
+            )
         } catch (e: Exception) {
             // 忽略高亮错误
         }
@@ -1636,7 +1893,8 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      * 清除搜索高亮
      */
     private fun clearSearchHighlights() {
-        logArea.highlighter.removeAllHighlights()
+        val markupModel = com.intellij.openapi.editor.impl.DocumentMarkupModel.forDocument(document, project, true)
+        markupModel.removeAllHighlighters()
     }
     
     /**
@@ -1665,17 +1923,11 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         if (index < 0 || index >= searchResults.size) return
         
         val position = searchResults[index]
-        logArea.caretPosition = position
+        editor.caretModel.moveToOffset(position)
+        editor.selectionModel.removeSelection()
         
         // 确保可见
-        try {
-            val rect = logArea.modelToView2D(position)
-            if (rect != null) {
-                logArea.scrollRectToVisible(rect.bounds)
-            }
-        } catch (e: Exception) {
-            // 忽略
-        }
+        editor.scrollingModel.scrollToCaret(com.intellij.openapi.editor.ScrollType.CENTER)
         
         // 更新结果标签
         searchResultLabel?.text = "${index + 1}/${searchResults.size}"
@@ -1758,7 +2010,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         
         val buttonPanel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
         buttonPanel.isOpaque = false
-        
+
         hexModeCheckBox.toolTipText = "HEX模式发送"
         buttonPanel.add(hexModeCheckBox)
         
@@ -1827,55 +2079,77 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         // 发送
         sendField.addActionListener { sendData() }
         
-        // 过滤器实时应用 + 自动补全建议
-        filterField.document.addDocumentListener(object : DocumentListener {
-            private var filterTimer: Timer? = null
-            private var suggestionTimer: Timer? = null
-            
-            override fun insertUpdate(e: DocumentEvent) { scheduleFilter(); scheduleSuggestion() }
-            override fun removeUpdate(e: DocumentEvent) { scheduleFilter(); hideSuggestions() }
-            override fun changedUpdate(e: DocumentEvent) { scheduleFilter() }
-            
-            private fun scheduleFilter() {
+        // 过滤器实时应用 (参考 Logcat FilterTextField)
+        filterTextField.addDocumentListener(object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                // 从事件获取最新文本 (重要！filterTextField.text 可能还没更新)
+                val filterText = event.document.text
+                
+                // 更新收藏按钮状态
+                val isFav = filterFavorites.contains(filterText)
+                favoriteBtn?.icon = if (isFav) AllIcons.Nodes.Favorite else AllIcons.Nodes.NotFavoriteOnHover
+                
+                // 延迟应用过滤器 (避免频繁刷新)
                 filterTimer?.stop()
-                filterTimer = Timer(200) { applyFilter() }.apply {
+                filterTimer = Timer(150) {
+                    val filter = parseFilterExpression(filterText)
+                    filterManager.setActiveFilter(filter)
+                    refreshDisplay()
+                }.apply {
                     isRepeats = false
                     start()
-                }
             }
             
-            private fun scheduleSuggestion() {
+                // 延迟显示自动补全建议
                 suggestionTimer?.stop()
-                suggestionTimer = Timer(100) { showAutoCompleteSuggestions() }.apply {
+                suggestionTimer = Timer(100) {
+                    showAutoCompleteSuggestions()
+                }.apply {
                     isRepeats = false
                     start()
                 }
-            }
-            
-            private fun hideSuggestions() {
-                filterPopup?.cancel()
-                filterPopup = null
             }
         })
         
-        // Esc 清除过滤
-        filterField.addKeyListener(object : KeyAdapter() {
+        // 在 EditorTextField 添加到 UI 后添加 KeyListener
+        filterTextField.addHierarchyListener { e ->
+            if ((e.changeFlags and java.awt.event.HierarchyEvent.SHOWING_CHANGED.toLong()) != 0L) {
+                if (filterTextField.isShowing) {
+                    filterTextField.editor?.contentComponent?.addKeyListener(object : KeyAdapter() {
             override fun keyPressed(e: KeyEvent) {
-                if (e.keyCode == KeyEvent.VK_ESCAPE) {
-                    filterField.text = ""
+                            when (e.keyCode) {
+                                KeyEvent.VK_ESCAPE -> {
+                                    filterTextField.text = ""
                     applyFilter()
-                } else if (e.keyCode == KeyEvent.VK_DOWN && filterField.text.isEmpty()) {
+                                    e.consume()
+                                }
+                                KeyEvent.VK_DOWN -> {
+                                    if (filterTextField.text.isEmpty()) {
                     showFilterSuggestions()
+                                        e.consume()
+                                    }
+                                }
+                                KeyEvent.VK_ENTER -> {
+                                    // 保存到历史
+                                    if (filterTextField.text.isNotBlank()) {
+                                        addToFilterHistory(filterTextField.text)
+                                    }
+                                    e.consume()
+                                }
+                            }
+                        }
+                    })
                 }
             }
-        })
+        }
         
         // 快捷键
         setupKeyboardShortcuts()
     }
     
     private fun setupKeyboardShortcuts() {
-        val inputMap = mainPanel.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT)
+        // Use WHEN_IN_FOCUSED_WINDOW so Ctrl+F works even when focus is inside EditorEx.
+        val inputMap = mainPanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
         val actionMap = mainPanel.actionMap
         
         // Ctrl+L 清空
@@ -1888,6 +2162,17 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx), "showSearch")
         actionMap.put("showSearch", object : AbstractAction() {
             override fun actionPerformed(e: ActionEvent?) = showSearchBar()
+        })
+
+        // Fallback for EditorEx: some IDE key handlers may consume Ctrl+F first.
+        editor.contentComponent.addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                val isMenuShortcut = (e.modifiersEx and Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx) != 0
+                if (isMenuShortcut && e.keyCode == KeyEvent.VK_F) {
+                    showSearchBar()
+                    e.consume()
+                }
+            }
         })
         
         // F3 下一个搜索结果
@@ -1919,7 +2204,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             connectButton.foreground = JBColor.RED
         } else {
             connectButton.text = "连接"
-            connectButton.foreground = JBColor(Color(0, 153, 0), Color(80, 200, 80))
+            connectButton.foreground = JBColor(Color(210, 90, 70), Color(240, 120, 95))
         }
     }
     
@@ -1940,11 +2225,14 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             
             // 如果没有检测到串口，显示诊断信息在日志窗口
             if (rawPorts.isEmpty()) {
-                javax.swing.SwingUtilities.invokeLater {
-                    val doc = logArea.styledDocument
-                    val style = logArea.addStyle("diag", null)
-                    javax.swing.text.StyleConstants.setForeground(style, java.awt.Color.ORANGE)
-                    doc.insertString(doc.length, diagInfo.toString(), style)
+                coroutineScope.launch(Dispatchers.EDT) {
+                    val message = SerialPortMessage(
+                        timestamp = Instant.now(),
+                        direction = SerialPortMessage.Direction.SYS,
+                        level = SerialPortMessage.LogLevel.WARN,
+                        content = diagInfo.toString()
+                    )
+                    processMessages(listOf(message))
                 }
             }
         } catch (e: Exception) {
@@ -1996,7 +2284,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     }
     
     private fun applyFilter() {
-        val filterText = filterField.text
+        val filterText = filterTextField.text
         // 保存到历史记录
         if (filterText.isNotBlank()) {
             addToFilterHistory(filterText)
@@ -2024,6 +2312,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         var keyword = ""
         var isRegex = false
         var isExact = false
+        var isImplicitLine = true  // 默认搜索整行 (Logcat IMPLICIT_LINE)
         var excludeKeyword = ""
         var excludeIsRegex = false
         var excludeIsExact = false
@@ -2040,17 +2329,61 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             return FilterCondition(minLevel = minLevel)
         }
         
-        val parts = expression.split("\\s+".toRegex())
+        val plainTerms = mutableListOf<String>()
+        val parts = tokenizeFilterExpression(expression)
         for (part in parts) {
             when {
+                // 运算符与括号（当前实现为兼容忽略）
+                part == "&" || part == "|" || part == "(" || part == ")" -> Unit
                 // 排除过滤 (Logcat 风格)
-                part.startsWith("-message~:") -> { excludeKeyword = part.substringAfter("-message~:"); excludeIsRegex = true }
-                part.startsWith("-message=:") -> { excludeKeyword = part.substringAfter("-message=:"); excludeIsExact = true }
-                part.startsWith("-message:") -> excludeKeyword = part.substringAfter("-message:")
-                // 包含过滤 (Logcat 风格)
-                part.startsWith("message~:") -> { keyword = part.substringAfter("message~:"); isRegex = true }
-                part.startsWith("message=:") -> { keyword = part.substringAfter("message=:"); isExact = true }
-                part.startsWith("message:") -> keyword = part.substringAfter("message:")
+                part.startsWith("-message~:") -> {
+                    excludeKeyword = unquoteFilterValue(part.substringAfter("-message~:"))
+                    excludeIsRegex = true
+                }
+                part.startsWith("-message=:") -> {
+                    excludeKeyword = unquoteFilterValue(part.substringAfter("-message=:"))
+                    excludeIsExact = true
+                }
+                part.startsWith("-message:") -> excludeKeyword = unquoteFilterValue(part.substringAfter("-message:"))
+                part.startsWith("-line~:") -> {
+                    excludeKeyword = unquoteFilterValue(part.substringAfter("-line~:"))
+                    excludeIsRegex = true
+                }
+                part.startsWith("-line=:") -> {
+                    excludeKeyword = unquoteFilterValue(part.substringAfter("-line=:"))
+                    excludeIsExact = true
+                }
+                part.startsWith("-line:") -> excludeKeyword = unquoteFilterValue(part.substringAfter("-line:"))
+                // 包含过滤 (Logcat 风格) - 只搜索消息内容
+                part.startsWith("message~:") -> { 
+                    keyword = unquoteFilterValue(part.substringAfter("message~:"))
+                    isRegex = true
+                    isImplicitLine = false  // 只搜索消息
+                }
+                part.startsWith("message=:") -> { 
+                    keyword = unquoteFilterValue(part.substringAfter("message=:"))
+                    isExact = true
+                    isImplicitLine = false  // 只搜索消息
+                }
+                part.startsWith("message:") -> {
+                    keyword = unquoteFilterValue(part.substringAfter("message:"))
+                    isImplicitLine = false  // 只搜索消息
+                }
+                // line: 过滤（和 Logcat 一样作用于整行）
+                part.startsWith("line~:") -> {
+                    keyword = unquoteFilterValue(part.substringAfter("line~:"))
+                    isRegex = true
+                    isImplicitLine = true
+                }
+                part.startsWith("line=:") -> {
+                    keyword = unquoteFilterValue(part.substringAfter("line=:"))
+                    isExact = true
+                    isImplicitLine = true
+                }
+                part.startsWith("line:") -> {
+                    keyword = unquoteFilterValue(part.substringAfter("line:"))
+                    isImplicitLine = true
+                }
                 // 方向过滤
                 part.startsWith("-dir:") -> {
                     val dir = part.substringAfter("-dir:").uppercase()
@@ -2082,8 +2415,53 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
                 // 特殊过滤 (Logcat is: 语法)
                 part == "is:crash" -> onlyCrash = true
                 part == "is:stacktrace" -> onlyStacktrace = true
-                // 普通关键词
-                else -> if (keyword.isEmpty() && part.isNotEmpty() && !part.contains(":")) keyword = part
+                // 普通关键词 - 搜索整行 (Logcat IMPLICIT_LINE)
+                else -> if (part.isNotEmpty() && !part.contains(":")) {
+                    plainTerms.add(unquoteFilterValue(part))
+                }
+            }
+        }
+
+        // Logcat 风格：连续普通词条合并为一个整行查询（foo bar => "foo bar"）
+        if (keyword.isEmpty() && plainTerms.isNotEmpty()) {
+            keyword = plainTerms.joinToString(" ")
+            isImplicitLine = true
+        }
+
+        // 对齐 Logcat 行为：正则非法时退化为整行普通字符串查询，而不是“匹配全部”
+        if (isRegex && keyword.isNotEmpty()) {
+            val valid = try {
+                Regex(keyword, RegexOption.IGNORE_CASE)
+                true
+            } catch (_: Exception) {
+                false
+            }
+            if (!valid) {
+                return FilterCondition(
+                    keyword = expression.trim(),
+                    isRegex = false,
+                    isExact = false,
+                    matchCase = filterMatchCase,
+                    isImplicitLine = true,
+                    minLevel = minLevel,
+                    showTx = showTx,
+                    showRx = showRx,
+                    showSystem = showSys,
+                    maxAgeMs = maxAgeMs,
+                    onlyCrash = onlyCrash,
+                    onlyStacktrace = onlyStacktrace
+                )
+            }
+        }
+        if (excludeIsRegex && excludeKeyword.isNotEmpty()) {
+            val valid = try {
+                Regex(excludeKeyword, RegexOption.IGNORE_CASE)
+                true
+            } catch (_: Exception) {
+                false
+            }
+            if (!valid) {
+                excludeIsRegex = false
             }
         }
         
@@ -2091,6 +2469,8 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             keyword = keyword,
             isRegex = isRegex,
             isExact = isExact,
+            matchCase = filterMatchCase,
+            isImplicitLine = isImplicitLine,
             excludeKeyword = excludeKeyword,
             excludeIsRegex = excludeIsRegex,
             excludeIsExact = excludeIsExact,
@@ -2103,12 +2483,75 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             onlyStacktrace = onlyStacktrace
         )
     }
+
+    private fun tokenizeFilterExpression(expression: String): List<String> {
+        val tokens = mutableListOf<String>()
+        val current = StringBuilder()
+        var quoteChar: Char? = null
+        var escaped = false
+
+        fun flush() {
+            if (current.isNotEmpty()) {
+                tokens.add(current.toString())
+                current.clear()
+            }
+        }
+
+        for (ch in expression) {
+            if (escaped) {
+                current.append(ch)
+                escaped = false
+                continue
+            }
+            if (ch == '\\') {
+                escaped = true
+                current.append(ch)
+                continue
+            }
+
+            if (quoteChar != null) {
+                current.append(ch)
+                if (ch == quoteChar) {
+                    quoteChar = null
+                }
+                continue
+            }
+
+            when {
+                ch == '\'' || ch == '"' -> {
+                    quoteChar = ch
+                    current.append(ch)
+                }
+                ch.isWhitespace() -> flush()
+                else -> current.append(ch)
+            }
+        }
+        flush()
+        return tokens
+    }
+
+    private fun unquoteFilterValue(value: String): String {
+        val trimmed = value.trim()
+        if (trimmed.length < 2) return trimmed
+        val first = trimmed.first()
+        val last = trimmed.last()
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            val raw = trimmed.substring(1, trimmed.length - 1)
+            return raw
+                .replace("\\\\", "\\")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+        }
+        return trimmed
+    }
     
     private fun refreshDisplay() {
-        SwingUtilities.invokeLater {
+        coroutineScope.launch(Dispatchers.EDT) {
             try {
-                logDocument.remove(0, logDocument.length)
-                filterManager.getFilteredEntries().forEach { appendEntryToDisplay(it) }
+                clearDocument()
+                val filteredEntries = filterManager.getFilteredEntries()
+                val messages = filteredEntries.map { it.toSerialPortMessage() }
+                processMessages(messages)
                 if (autoScroll) scrollToBottom()
                 updateStatusBar()
             } catch (e: Exception) { /* ignore */ }
@@ -2116,75 +2559,63 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     }
     
     /**
-     * Logcat 风格日志格式:
-     * Standard View: MM-dd HH:mm:ss.SSS  L/TAG  : content
-     * Compact View:  HH:mm:ss L : content
-     * 
-     * 不同方向使用不同颜色的标签 (TX蓝/RX绿/SYS灰/ERR红)
+     * 处理消息并追加到文档 (参考 Logcat)
      */
-    private fun appendEntryToDisplay(entry: LogEntry) {
-        // 根据日志级别选择消息样式
-        val messageStyle = when (entry.level) {
-            LogLevel.VERBOSE -> verboseStyle
-            LogLevel.DEBUG -> debugStyle
-            LogLevel.INFO -> infoStyle
-            LogLevel.WARN -> warnStyle
-            LogLevel.ERROR -> errorStyle
-        }
+    private suspend fun processMessages(messages: List<SerialPortMessage>) {
+        if (messages.isEmpty()) return
         
-        // 根据方向选择标签样式 (Logcat 风格: 不同标签不同颜色)
-        val tagStyle = when (entry.direction) {
-            "TX" -> txTagStyle
-            "RX" -> rxTagStyle
-            "SYS" -> sysTagStyle
-            "ERR" -> errTagStyle
-            else -> sysTagStyle
-        }
+        messageBacklog.addAll(messages)
         
-        // 级别单字母标签 (Logcat 风格)
-        val levelChar = when (entry.level) {
-            LogLevel.VERBOSE -> 'V'
-            LogLevel.DEBUG -> 'D'
-            LogLevel.INFO -> 'I'
-            LogLevel.WARN -> 'W'
-            LogLevel.ERROR -> 'E'
-        }
+        // 更新格式化器设置
+        messageFormatter.setShowTimestamp(showTimestamp)
+        messageFormatter.setDisplayHex(displayHex)
+        messageFormatter.setCompactView(isCompactView)
+        messageFormatter.setSoftWrapEnabled(editor.settings.isUseSoftWraps)
         
-        // 方向标签 (作为 Tag)
-        val tag = entry.direction.padEnd(3)
+        // 格式化消息
+        val textAccumulator = TextAccumulator()
+        messageFormatter.formatMessages(textAccumulator, messages)
         
-        // 内容处理
-        val content = if (displayHex && entry.rawData != null) {
-            entry.rawData.joinToString(" ") { "%02X".format(it) }
-        } else {
-            entry.content
-        }
-        
-        try {
-            if (isCompactView) {
-                // Compact View: 只显示时间(HH:mm:ss) + 级别 + 消息
-                val shortTime = entry.timestamp.substringAfter(" ").substringBefore(".")
-                logDocument.insertString(logDocument.length, "$shortTime ", verboseStyle)
-                logDocument.insertString(logDocument.length, "$levelChar ", messageStyle)
-                logDocument.insertString(logDocument.length, ": $content\n", messageStyle)
-        } else {
-                // Standard View: 完整格式，分段显示不同颜色
-                if (showTimestamp) {
-                    // 时间戳 (灰色)
-                    logDocument.insertString(logDocument.length, "${entry.timestamp}  ", verboseStyle)
-                }
-                // 级别字符 (按级别着色)
-                logDocument.insertString(logDocument.length, "$levelChar/", messageStyle)
-                // 方向标签 (按方向着色 - Logcat 风格)
-                logDocument.insertString(logDocument.length, tag, tagStyle)
-                // 分隔符和内容
-                logDocument.insertString(logDocument.length, " : $content\n", messageStyle)
-            }
-        } catch (e: BadLocationException) { /* ignore */ }
+        // 追加到文档
+        appendMessages(textAccumulator)
     }
     
+    /**
+     * 追加消息到文档 (参考 Logcat)
+     */
+    private suspend fun appendMessages(textAccumulator: TextAccumulator) {
+        withContext(Dispatchers.EDT) {
+            documentAppender.appendToDocument(textAccumulator)
+            
+            // 使用 autoScroll 判断是否自动滚动到底部
+            if (autoScroll) {
+                scrollToBottom()
+            }
+        }
+    }
+    
+    /**
+     * 清空文档 (参考 Logcat clearDocument)
+     */
+    private fun clearDocument() {
+        com.intellij.openapi.application.WriteAction.run<Throwable> {
+            document.setText("")
+        }
+        messageFormatter.reset()
+        documentAppender.reset()  // 重置高亮范围
+    }
+    
+    // appendEntryToDisplay 函数已被新的消息处理机制替代
+    // 现在使用 processMessages() 和 MessageFormatter 来处理消息
+    
     private fun scrollToBottom() {
-        logArea.caretPosition = logDocument.length
+        com.intellij.openapi.editor.ex.util.EditorUtil.scrollToTheEnd(editor, true)
+        caretLine = document.lineCount
+        ignoreCaretAtBottom = false
+        if (!autoScroll) {
+            autoScroll = true
+            autoScrollBtn?.let { updateToggleButton(it, true) }
+        }
     }
     
     private fun exportLog() {
@@ -2268,11 +2699,12 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     }
     
     override fun onDataReceived(data: ByteArray, timestamp: String) {
+        val content = String(data, StandardCharsets.UTF_8)
         filterManager.addEntry(LogEntry(
             timestamp = timestamp,
             direction = "RX",
-            content = String(data, StandardCharsets.UTF_8),
-            level = LogLevel.DEBUG,
+            content = content,
+            level = parseLogLevel(content),  // 自动解析日志级别
             rawData = data
         ))
     }
@@ -2282,9 +2714,87 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             timestamp = timestamp,
             direction = "TX",
             content = data,
-            level = LogLevel.DEBUG,
+            level = parseLogLevel(data),  // 自动解析日志级别
             rawData = data.toByteArray()
         ))
+    }
+    
+    /**
+     * 根据日志内容自动解析日志级别 (参考 Logcat)
+     * 支持格式：
+     * - [V] [D] [I] [W] [E] 或 [VERBOSE] [DEBUG] [INFO] [WARN] [ERROR]
+     * - V/ D/ I/ W/ E/ (Logcat 格式)
+     * - 关键词: error, exception, fatal, warning, warn, info, debug, verbose
+     */
+    private fun parseLogLevel(content: String): LogLevel {
+        val trimmed = content.trim()
+        val upper = trimmed.uppercase()
+        
+        // 1. 检查 Logcat 格式: V/ D/ I/ W/ E/
+        if (trimmed.length >= 2) {
+            val prefix = trimmed.substring(0, 2)
+            when (prefix) {
+                "V/", "v/" -> return LogLevel.VERBOSE
+                "D/", "d/" -> return LogLevel.DEBUG
+                "I/", "i/" -> return LogLevel.INFO
+                "W/", "w/" -> return LogLevel.WARN
+                "E/", "e/" -> return LogLevel.ERROR
+            }
+        }
+        
+        // 2. 检查方括号格式: [E] [ERROR] [W] [WARN] 等
+        val bracketPattern = Regex("^\\s*\\[([VDIWE]|VERBOSE|DEBUG|INFO|WARN(?:ING)?|ERROR)\\]", RegexOption.IGNORE_CASE)
+        bracketPattern.find(trimmed)?.let { match ->
+            return when (match.groupValues[1].uppercase()) {
+                "V", "VERBOSE" -> LogLevel.VERBOSE
+                "D", "DEBUG" -> LogLevel.DEBUG
+                "I", "INFO" -> LogLevel.INFO
+                "W", "WARN", "WARNING" -> LogLevel.WARN
+                "E", "ERROR" -> LogLevel.ERROR
+                else -> LogLevel.DEBUG
+            }
+        }
+        
+        // 3. 检查级别前缀: ERROR: WARN: INFO: DEBUG: VERBOSE:
+        val prefixPattern = Regex("^\\s*(ERROR|WARN(?:ING)?|INFO|DEBUG|VERBOSE)\\s*[:\\-]", RegexOption.IGNORE_CASE)
+        prefixPattern.find(trimmed)?.let { match ->
+            return when (match.groupValues[1].uppercase()) {
+                "VERBOSE" -> LogLevel.VERBOSE
+                "DEBUG" -> LogLevel.DEBUG
+                "INFO" -> LogLevel.INFO
+                "WARN", "WARNING" -> LogLevel.WARN
+                "ERROR" -> LogLevel.ERROR
+                else -> LogLevel.DEBUG
+            }
+        }
+        
+        // 4. 检查关键词 (优先级从高到低)
+        return when {
+            // Error 级别关键词
+            upper.contains("ERROR") || 
+            upper.contains("EXCEPTION") || 
+            upper.contains("FATAL") ||
+            upper.contains("FAILURE") ||
+            upper.contains("FAILED") ||
+            upper.contains("CRASH") -> LogLevel.ERROR
+            
+            // Warn 级别关键词
+            upper.contains("WARN") ||
+            upper.contains("CAUTION") -> LogLevel.WARN
+            
+            // Info 级别关键词
+            upper.contains("INFO") ||
+            upper.contains("SUCCESS") ||
+            upper.contains("CONNECTED") ||
+            upper.contains("READY") -> LogLevel.INFO
+            
+            // Verbose 级别关键词
+            upper.contains("VERBOSE") ||
+            upper.contains("TRACE") -> LogLevel.VERBOSE
+            
+            // 默认 Debug
+            else -> LogLevel.DEBUG
+        }
     }
     
     override fun onError(message: String) {
@@ -2330,18 +2840,22 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         // 暂停时不更新显示
         if (isPaused) return
         
-        SwingUtilities.invokeLater {
-            appendEntryToDisplay(entry)
+        coroutineScope.launch {
+            val message = entry.toSerialPortMessage()
+            processMessages(listOf(message))
+            withContext(Dispatchers.EDT) {
             if (autoScroll) scrollToBottom()
             updateStatusBar()
+            }
         }
     }
     
     override fun onFilterChanged(filteredEntries: List<LogEntry>) {}
     
     override fun onLogsCleared() {
-        SwingUtilities.invokeLater {
-            try { logDocument.remove(0, logDocument.length) } catch (e: Exception) {}
+        coroutineScope.launch(Dispatchers.EDT) {
+            messageBacklog.clear()
+            clearDocument()
         }
     }
 }
