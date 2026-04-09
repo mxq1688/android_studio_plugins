@@ -117,7 +117,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
     // UI 引用 (用于状态同步)
     private var autoScrollBtn: JButton? = null
     private var pauseBtn: JButton? = null
-    private var logScrollPane: JBScrollPane? = null
+    // removed logScrollPane since EditorEx has its own scroll pane
     private var statusLabel: JLabel? = null  // 状态栏统计显示
     
     // 滚动状态管理 (参考 Logcat)
@@ -231,6 +231,11 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         val caretAtBottom = editor.isCaretAtBottom()
         if (!scrollAtBottom && caretAtBottom) {
             ignoreCaretAtBottom = true
+        }
+        
+        if (autoScroll != scrollAtBottom) {
+            autoScroll = scrollAtBottom
+            autoScrollBtn?.let { updateToggleButton(it, autoScroll) }
         }
     }
     
@@ -447,11 +452,27 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         toolbar.add(refreshBtn)
         
         // 5. 滚动到底部 (自动滚动开关)
-        autoScrollBtn = createLeftToolbarToggleButton(AllIcons.Actions.MoveDown, "滚动到底部/自动滚动", autoScroll)
+        autoScrollBtn = createLeftToolbarToggleButton(AllIcons.RunConfigurations.Scroll_down, "滚动到底部/自动滚动", autoScroll)
         autoScrollBtn!!.addActionListener {
-            autoScroll = true
-            updateToggleButton(autoScrollBtn!!, autoScroll)
-            scrollToBottom()
+            if (autoScroll) {
+                // 当前是开启状态，点击则关闭自动滚动
+                autoScroll = false
+                updateToggleButton(autoScrollBtn!!, false)
+                
+                // 将光标上移一行，打破 isCaretAtBottom 状态 (参考 Logcat)
+                val lastLine = maxOf(0, editor.document.lineCount - 1)
+                val currentPos = editor.caretModel.logicalPosition
+                val newPos = com.intellij.openapi.editor.LogicalPosition(
+                    maxOf(0, minOf(currentPos.line, lastLine - 1)), 
+                    currentPos.column
+                )
+                editor.caretModel.moveToLogicalPosition(newPos)
+            } else {
+                // 当前是关闭状态，点击则开启并滚到底部
+                autoScroll = true
+                updateToggleButton(autoScrollBtn!!, true)
+                scrollToBottom()
+            }
         }
         toolbar.add(autoScrollBtn)
         
@@ -460,26 +481,16 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         pageUpBtn.addActionListener { 
             autoScroll = false
             updateToggleButton(autoScrollBtn!!, autoScroll)
-            val scrollPane = editor.scrollPane
-            val viewport = scrollPane.viewport
-            viewport?.let {
-                val rect = it.viewRect
-                rect.y = maxOf(0, rect.y - rect.height)
-                editor.contentComponent.scrollRectToVisible(rect)
-            }
+            val scrollBar = editor.scrollPane.verticalScrollBar
+            scrollBar.value = maxOf(0, scrollBar.value - scrollBar.blockIncrement)
         }
         toolbar.add(pageUpBtn)
         
         // 7. 向下翻页
         val pageDownBtn = createLeftToolbarButton(AllIcons.Actions.MoveDown, "向下翻页")
         pageDownBtn.addActionListener { 
-            val scrollPane = editor.scrollPane
-            val viewport = scrollPane.viewport
-            viewport?.let {
-                val rect = it.viewRect
-                rect.y = minOf(editor.contentComponent.height - rect.height, rect.y + rect.height)
-                editor.contentComponent.scrollRectToVisible(rect)
-            }
+            val scrollBar = editor.scrollPane.verticalScrollBar
+            scrollBar.value = minOf(scrollBar.maximum - scrollBar.visibleAmount, scrollBar.value + scrollBar.blockIncrement)
         }
         toolbar.add(pageDownBtn)
         
@@ -495,12 +506,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         wrapBtn.addActionListener {
             softWrap = !softWrap
             updateToggleButton(wrapBtn, softWrap)
-            // 通过调整滚动条策略实现软换行效果
-            logScrollPane?.horizontalScrollBarPolicy = if (softWrap) {
-                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
-            } else {
-                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
-            }
+            editor.settings.isUseSoftWraps = softWrap
         }
         toolbar.add(wrapBtn)
         
@@ -1624,17 +1630,17 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
         panel.add(searchBar, BorderLayout.NORTH)
         
         // 使用 EditorEx 替代 JTextPane (Logcat 风格)
-        logScrollPane = JBScrollPane(editor.component)
+        val editorComp = editor.component
         // Logcat 风格的边框：顶部有边框线
-        logScrollPane!!.border = BorderFactory.createCompoundBorder(
+        editorComp.border = BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor.border()),
             BorderFactory.createEmptyBorder()
         )
         
         // Keep auto-scroll state synced with viewport position.
         // If user scrolls up -> autoScroll=false; scrolls back to bottom -> autoScroll=true.
-        logScrollPane!!.verticalScrollBar.addAdjustmentListener {
-            val bar = logScrollPane!!.verticalScrollBar
+        editor.scrollPane.verticalScrollBar.addAdjustmentListener {
+            val bar = editor.scrollPane.verticalScrollBar
             val atBottom = bar.value + bar.visibleAmount >= bar.maximum - 2
             if (autoScroll != atBottom) {
                 autoScroll = atBottom
@@ -1642,7 +1648,7 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
             }
         }
         
-        panel.add(logScrollPane, BorderLayout.CENTER)
+        panel.add(editorComp, BorderLayout.CENTER)
         return panel
     }
     
@@ -2585,11 +2591,18 @@ class SerialPortToolWindow(private val project: Project) : SerialPortListener, P
      */
     private suspend fun appendMessages(textAccumulator: TextAccumulator) {
         withContext(Dispatchers.EDT) {
+            // 参考 Logcat: 检查是否需要保持在底部
+            val shouldStickToEnd = !ignoreCaretAtBottom && editor.isCaretAtBottom()
+            ignoreCaretAtBottom = false
+            
             documentAppender.appendToDocument(textAccumulator)
             
-            // 使用 autoScroll 判断是否自动滚动到底部
-            if (autoScroll) {
+            if (shouldStickToEnd) {
                 scrollToBottom()
+            } else if (autoScroll) {
+                // 如果没有保持在底部（比如刚插入数据时发现光标不在底部），则取消自动滚动
+                autoScroll = false
+                autoScrollBtn?.let { updateToggleButton(it, false) }
             }
         }
     }
