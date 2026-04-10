@@ -1,7 +1,7 @@
 <idea-plugin>
-    <id>com.serialport.plugin</id>
+    <id>com.mxq1688.serialport</id>
     <name>Serial Port Tool</name>
-    <vendor email="support@serialport.com" url="https://github.com/serialport/plugin">Serial Port Team</vendor>
+    <vendor email="1365732392@qq.com" url="https://github.com/mxq1688/android_studio_plugins">mxq1688</vendor>
 
     <description><![CDATA[
     <h2>Android Studio Serial Port Tool Plugin</h2>
