@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.serialport"
-version = "1.0.0"
+version = "1.0.2"
 
 repositories {
     mavenCentral()
@@ -31,8 +31,7 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild.set("252")
-            untilBuild.set("252.*")
+            sinceBuild.set("241")
         }
     }
     signing {
